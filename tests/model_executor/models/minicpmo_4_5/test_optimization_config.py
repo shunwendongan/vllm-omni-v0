@@ -5,6 +5,8 @@
 import pytest
 
 from vllm_omni.model_executor.models.minicpmo_4_5.optimization_config import (
+    INITIAL_STATE_CACHE_ENV,
+    INITIAL_STATE_CACHE_MAX_ENTRIES_ENV,
     PERF_STATS_ENV,
     TENSOR_HANDOFF_ENV,
     MiniCPMO45OptimizationConfig,
@@ -17,6 +19,8 @@ def test_optimization_flags_default_to_disabled() -> None:
     config = MiniCPMO45OptimizationConfig.from_env({})
 
     assert config.tensor_handoff is False
+    assert config.initial_state_cache is False
+    assert config.initial_state_cache_max_entries == 1
     assert config.perf_stats is False
 
 
@@ -37,3 +41,34 @@ def test_perf_stats_can_be_enabled_independently() -> None:
 def test_invalid_boolean_fails_fast() -> None:
     with pytest.raises(ValueError, match=TENSOR_HANDOFF_ENV):
         MiniCPMO45OptimizationConfig.from_env({TENSOR_HANDOFF_ENV: "sometimes"})
+
+
+def test_initial_state_cache_parses_capacity() -> None:
+    config = MiniCPMO45OptimizationConfig.from_env(
+        {
+            INITIAL_STATE_CACHE_ENV: "1",
+            INITIAL_STATE_CACHE_MAX_ENTRIES_ENV: "3",
+        }
+    )
+
+    assert config.initial_state_cache is True
+    assert config.initial_state_cache_max_entries == 3
+
+
+@pytest.mark.parametrize("value", ["-1", "1.5", "many", ""])
+def test_invalid_initial_state_cache_capacity_fails_fast(value: str) -> None:
+    with pytest.raises(ValueError, match=INITIAL_STATE_CACHE_MAX_ENTRIES_ENV):
+        MiniCPMO45OptimizationConfig.from_env({INITIAL_STATE_CACHE_MAX_ENTRIES_ENV: value})
+
+
+def test_zero_capacity_is_only_valid_while_cache_is_disabled() -> None:
+    disabled = MiniCPMO45OptimizationConfig.from_env({INITIAL_STATE_CACHE_MAX_ENTRIES_ENV: "0"})
+    assert disabled.initial_state_cache_max_entries == 0
+
+    with pytest.raises(ValueError, match=INITIAL_STATE_CACHE_MAX_ENTRIES_ENV):
+        MiniCPMO45OptimizationConfig.from_env(
+            {
+                INITIAL_STATE_CACHE_ENV: "1",
+                INITIAL_STATE_CACHE_MAX_ENTRIES_ENV: "0",
+            }
+        )
