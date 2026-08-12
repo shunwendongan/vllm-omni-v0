@@ -4,15 +4,27 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
+from hashlib import sha256
+from io import BytesIO
+from pathlib import Path
+from time import perf_counter_ns
 from typing import Any
 
+import soundfile as sf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .optimization_config import (
+    MINICPMO45_OPTIMIZATION_CONFIG,
+    MINICPMO45_PERF_STATS,
+)
+
 _SILENCE_TOKEN = 4218
+_INITIAL_STATE_TEMPLATE_SCHEMA_VERSION = 1
 
 
 def _autocast_disabled(device: torch.device):
@@ -52,6 +64,28 @@ class BatchedToken2WavState:
     hift_cache: dict[str, torch.Tensor]
 
 
+@dataclass(frozen=True)
+class InitialStateCacheKey:
+    schema_version: int
+    backend_type: str
+    backend_instance_id: int
+    prompt_cache_id: str
+    prompt_wav: str
+    prompt_sha256: str
+    prompt_sample_rate: int
+    device: str
+    dtype: str
+    float16: bool
+    n_timesteps: int
+    pre_lookahead_width: int
+
+
+@dataclass(frozen=True)
+class InitialStateTemplate:
+    key: InitialStateCacheKey
+    state: BatchedToken2WavState
+
+
 class BatchedToken2Wav(nn.Module):
     """Drive Token2wav's modules with dynamically-sized, request-owned caches.
 
@@ -60,7 +94,14 @@ class BatchedToken2Wav(nn.Module):
     asset loader and prompt feature extractor.
     """
 
-    def __init__(self, token2wav: Any):
+    def __init__(
+        self,
+        token2wav: Any,
+        *,
+        initial_state_cache_enabled: bool | None = None,
+        initial_state_cache_max_entries: int | None = None,
+        perf_stats: bool | None = None,
+    ):
         super().__init__()
         self._token2wav = token2wav
         self.flow = token2wav.flow
@@ -96,6 +137,28 @@ class BatchedToken2Wav(nn.Module):
             persistent=False,
         )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
+        max_entries = (
+            MINICPMO45_OPTIMIZATION_CONFIG.initial_state_cache_max_entries
+            if initial_state_cache_max_entries is None
+            else int(initial_state_cache_max_entries)
+        )
+        if max_entries < 0:
+            raise ValueError("initial_state_cache_max_entries must be non-negative")
+        self._initial_state_cache_max_entries = max_entries
+        # The optional overrides are internal test seams; production always
+        # consumes the process-wide startup configuration.
+        self._initial_state_cache_enabled = (
+            MINICPMO45_OPTIMIZATION_CONFIG.initial_state_cache
+            if initial_state_cache_enabled is None
+            else bool(initial_state_cache_enabled)
+        )
+        if self._initial_state_cache_enabled and max_entries < 1:
+            raise ValueError("initial-state cache requires initial_state_cache_max_entries >= 1")
+        self._perf_stats_enabled = MINICPMO45_OPTIMIZATION_CONFIG.perf_stats if perf_stats is None else bool(perf_stats)
+        self._initial_state_templates: OrderedDict[
+            InitialStateCacheKey,
+            InitialStateTemplate,
+        ] = OrderedDict()
 
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)
@@ -122,6 +185,16 @@ class BatchedToken2Wav(nn.Module):
     def evict_prompt(self, prompt_cache_id: str, prompt_wav: str) -> None:
         """Release request-owned prompt features after stream completion."""
         self._prompt_features.pop((prompt_cache_id, prompt_wav), None)
+        normalized_path = str(Path(prompt_wav).expanduser().resolve(strict=False))
+        matching_keys = [
+            key
+            for key in self._initial_state_templates
+            if key.prompt_cache_id == prompt_cache_id and key.prompt_wav == normalized_path
+        ]
+        for key in matching_keys:
+            self._initial_state_templates.pop(key)
+            if self._perf_stats_enabled:
+                MINICPMO45_PERF_STATS.record_initial_state_cache_evict()
 
     @staticmethod
     def _repeat_prompt(features: PromptFeatures, batch_size: int) -> tuple[torch.Tensor, ...]:
@@ -317,7 +390,55 @@ class BatchedToken2Wav(nn.Module):
             "estimator_att_cache": torch.cat((*conditional_att, *unconditional_att), dim=2),
         }
 
-    def setup_batch(
+    @staticmethod
+    def _clone_state(state: BatchedToken2WavState) -> BatchedToken2WavState:
+        # Decode mutates request state over time; each cache hit must own all
+        # storage and the template itself must remain immutable.
+        return BatchedToken2WavState(
+            flow_cache={name: value.detach().clone() for name, value in state.flow_cache.items()},
+            hift_cache={name: value.detach().clone() for name, value in state.hift_cache.items()},
+        )
+
+    @staticmethod
+    def _prompt_digest(prompt_wav: Path) -> tuple[str, int]:
+        digest = sha256()
+        header = bytearray()
+        with prompt_wav.open("rb") as prompt_file:
+            for chunk in iter(lambda: prompt_file.read(1024 * 1024), b""):
+                if len(header) < 65536:
+                    header.extend(chunk[: 65536 - len(header)])
+                digest.update(chunk)
+        sample_rate = int(sf.info(BytesIO(header)).samplerate)
+        return digest.hexdigest(), sample_rate
+
+    def _initial_state_cache_key(
+        self,
+        features: PromptFeatures,
+        *,
+        prompt_cache_id: str,
+        prompt_wav: str,
+    ) -> InitialStateCacheKey:
+        normalized_path = Path(prompt_wav).expanduser().resolve(strict=True)
+        prompt_digest, sample_rate = self._prompt_digest(normalized_path)
+        if sample_rate <= 0:
+            raise ValueError(f"MiniCPM-o initial-state prompt has invalid sample rate: {sample_rate}")
+        lookahead_width = self._pre_lookahead_len()
+        return InitialStateCacheKey(
+            schema_version=_INITIAL_STATE_TEMPLATE_SCHEMA_VERSION,
+            backend_type=(f"{type(self._token2wav).__module__}.{type(self._token2wav).__qualname__}"),
+            backend_instance_id=id(self._token2wav),
+            prompt_cache_id=prompt_cache_id,
+            prompt_wav=str(normalized_path),
+            prompt_sha256=prompt_digest,
+            prompt_sample_rate=sample_rate,
+            device=str(features.mels.device),
+            dtype=str(features.mels.dtype),
+            float16=self.float16,
+            n_timesteps=self.n_timesteps,
+            pre_lookahead_width=(3 if lookahead_width is None else lookahead_width),
+        )
+
+    def _setup_batch_uncached(
         self,
         features: PromptFeatures,
         batch_size: int,
@@ -362,6 +483,76 @@ class BatchedToken2Wav(nn.Module):
             )
             for row in split
         ]
+
+    def setup_batch(
+        self,
+        features: PromptFeatures,
+        batch_size: int,
+        *,
+        prompt_cache_id: str | None = None,
+        prompt_wav: str | None = None,
+        allow_initial_state_cache: bool = False,
+    ) -> list[BatchedToken2WavState]:
+        if not allow_initial_state_cache:
+            setup_started_ns = perf_counter_ns() if self._perf_stats_enabled else 0
+            states = self._setup_batch_uncached(features, batch_size)
+            if self._perf_stats_enabled:
+                if self._initial_state_cache_enabled:
+                    MINICPMO45_PERF_STATS.record_initial_state_cache(hit=False)
+                MINICPMO45_PERF_STATS.record_initial_state_setup(
+                    elapsed_ns=perf_counter_ns() - setup_started_ns,
+                )
+            return states
+
+        if not self._initial_state_cache_enabled:
+            raise ValueError("allow_initial_state_cache requires the initial-state cache switch")
+        if self._initial_state_cache_max_entries < 1:
+            raise ValueError("initial-state cache requires initial_state_cache_max_entries >= 1")
+        if prompt_cache_id is None or prompt_wav is None:
+            raise ValueError("initial-state cache requires prompt_cache_id and prompt_wav")
+
+        key = self._initial_state_cache_key(
+            features,
+            prompt_cache_id=prompt_cache_id,
+            prompt_wav=prompt_wav,
+        )
+        template = self._initial_state_templates.get(key)
+        if template is not None:
+            self._initial_state_templates.move_to_end(key)
+            clone_started_ns = perf_counter_ns() if self._perf_stats_enabled else 0
+            states = [self._clone_state(template.state) for _ in range(batch_size)]
+            if self._perf_stats_enabled:
+                MINICPMO45_PERF_STATS.record_initial_state_cache(hit=True)
+                MINICPMO45_PERF_STATS.record_initial_state_clone(
+                    elapsed_ns=perf_counter_ns() - clone_started_ns,
+                )
+            return states
+
+        setup_started_ns = perf_counter_ns() if self._perf_stats_enabled else 0
+        states = self._setup_batch_uncached(features, batch_size)
+        if self._perf_stats_enabled:
+            MINICPMO45_PERF_STATS.record_initial_state_cache(hit=False)
+            MINICPMO45_PERF_STATS.record_initial_state_setup(
+                elapsed_ns=perf_counter_ns() - setup_started_ns,
+            )
+        if not states:
+            raise ValueError("initial-state cache cannot store an empty setup batch")
+        clone_started_ns = perf_counter_ns() if self._perf_stats_enabled else 0
+        template = InitialStateTemplate(
+            key=key,
+            state=self._clone_state(states[0]),
+        )
+        if self._perf_stats_enabled:
+            MINICPMO45_PERF_STATS.record_initial_state_clone(
+                elapsed_ns=perf_counter_ns() - clone_started_ns,
+            )
+        self._initial_state_templates[key] = template
+        self._initial_state_templates.move_to_end(key)
+        while len(self._initial_state_templates) > self._initial_state_cache_max_entries:
+            self._initial_state_templates.popitem(last=False)
+            if self._perf_stats_enabled:
+                MINICPMO45_PERF_STATS.record_initial_state_cache_evict()
+        return states
 
     @staticmethod
     def _fade_in_out(

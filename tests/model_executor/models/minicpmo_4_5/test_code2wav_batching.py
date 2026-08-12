@@ -1,3 +1,4 @@
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +11,10 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.optimization_config import (
+    MINICPMO45_PERF_STATS,
+    MiniCPMO45OptimizationConfig,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -150,12 +155,59 @@ def _config(minimum: int = 1):
     )
 
 
-def _model():
+def _model(
+    *,
+    initial_state_cache: bool = False,
+    initial_state_cache_max_entries: int = 1,
+    perf_stats: bool = False,
+):
     token2wav = _FakeToken2Wav()
-    backend = BatchedToken2Wav(token2wav)
+    backend = BatchedToken2Wav(
+        token2wav,
+        initial_state_cache_enabled=initial_state_cache,
+        initial_state_cache_max_entries=initial_state_cache_max_entries,
+        perf_stats=perf_stats,
+    )
+    optimization_config = MiniCPMO45OptimizationConfig(
+        initial_state_cache=initial_state_cache,
+        initial_state_cache_max_entries=initial_state_cache_max_entries,
+        perf_stats=perf_stats,
+    )
     model = MiniCPMO45Code2Wav(vllm_config=_config())
+    model._optimization_config = optimization_config
     model.backend = backend
     return model, token2wav
+
+
+def _write_prompt_wav(path: Path, *, sample_rate: int = 16000) -> None:
+    import soundfile as sf
+
+    sf.write(
+        path,
+        torch.linspace(-0.1, 0.1, 160).numpy(),
+        sample_rate,
+        format="WAV",
+    )
+
+
+def _state_digest(state) -> str:
+    digest = sha256()
+    for cache in (state.flow_cache, state.hift_cache):
+        for name, value in sorted(cache.items()):
+            digest.update(name.encode())
+            digest.update(str(value.dtype).encode())
+            digest.update(str(tuple(value.shape)).encode())
+            digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _assert_states_equal(actual, expected) -> None:
+    assert actual.flow_cache.keys() == expected.flow_cache.keys()
+    assert actual.hift_cache.keys() == expected.hift_cache.keys()
+    for name in actual.flow_cache:
+        torch.testing.assert_close(actual.flow_cache[name], expected.flow_cache[name])
+    for name in actual.hift_cache:
+        torch.testing.assert_close(actual.hift_cache[name], expected.hift_cache[name])
 
 
 def test_code2wav_resolves_hf_model_id_for_assets(mocker, tmp_path):
@@ -282,6 +334,266 @@ def test_estimator_cache_stack_split_round_trip_preserves_cfg_rows():
         )
 
 
+def test_initial_state_cache_cold_miss_and_warm_hit_are_request_owned(tmp_path):
+    prompt_path = tmp_path / "default.wav"
+    _write_prompt_wav(prompt_path)
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(
+        token2wav,
+        initial_state_cache_enabled=True,
+        initial_state_cache_max_entries=1,
+    )
+    features = adapter.prepare_prompt("default", str(prompt_path))
+
+    cold = adapter.setup_batch(
+        features,
+        1,
+        prompt_cache_id="default",
+        prompt_wav=str(prompt_path),
+        allow_initial_state_cache=True,
+    )
+    setup_calls = list(token2wav.flow.encoder.calls)
+    template = next(iter(adapter._initial_state_templates.values()))
+    template_digest = _state_digest(template.state)
+    warm = adapter.setup_batch(
+        features,
+        2,
+        prompt_cache_id="default",
+        prompt_wav=str(prompt_path),
+        allow_initial_state_cache=True,
+    )
+
+    assert token2wav.flow.encoder.calls == setup_calls
+    _assert_states_equal(warm[0], cold[0])
+    _assert_states_equal(warm[1], cold[0])
+    for cache_name in warm[0].flow_cache:
+        assert warm[0].flow_cache[cache_name].data_ptr() != warm[1].flow_cache[cache_name].data_ptr()
+        assert warm[0].flow_cache[cache_name].data_ptr() != template.state.flow_cache[cache_name].data_ptr()
+    for cache_name in warm[0].hift_cache:
+        assert warm[0].hift_cache[cache_name] is not warm[1].hift_cache[cache_name]
+        assert warm[0].hift_cache[cache_name] is not template.state.hift_cache[cache_name]
+        if warm[0].hift_cache[cache_name].numel() > 0:
+            assert warm[0].hift_cache[cache_name].data_ptr() != warm[1].hift_cache[cache_name].data_ptr()
+            assert warm[0].hift_cache[cache_name].data_ptr() != template.state.hift_cache[cache_name].data_ptr()
+
+    warm[0].flow_cache["conformer_cnn_cache"].add_(1)
+    assert _state_digest(template.state) == template_digest
+
+
+def test_disabled_initial_state_cache_repeats_full_setup():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(
+        token2wav,
+        initial_state_cache_enabled=False,
+    )
+    features = adapter.prepare_prompt("default", "/fake/default.wav")
+
+    adapter.setup_batch(features, 1)
+    adapter.setup_batch(features, 1)
+
+    assert token2wav.flow.encoder.calls == [1, 1]
+    assert adapter._initial_state_templates == {}
+
+
+def test_initial_state_cache_hit_preserves_first_waveform(tmp_path):
+    prompt_path = tmp_path / "default.wav"
+    _write_prompt_wav(prompt_path)
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(
+        token2wav,
+        initial_state_cache_enabled=True,
+        initial_state_cache_max_entries=1,
+    )
+    features = adapter.prepare_prompt("default", str(prompt_path))
+    cold = adapter.setup_batch(
+        features,
+        1,
+        prompt_cache_id="default",
+        prompt_wav=str(prompt_path),
+        allow_initial_state_cache=True,
+    )
+    cold_audio, _ = adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        features,
+        cold,
+        last_chunk=False,
+    )
+    warm = adapter.setup_batch(
+        features,
+        1,
+        prompt_cache_id="default",
+        prompt_wav=str(prompt_path),
+        allow_initial_state_cache=True,
+    )
+    warm_audio, _ = adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        features,
+        warm,
+        last_chunk=False,
+    )
+
+    torch.testing.assert_close(warm_audio[0], cold_audio[0], rtol=0, atol=0)
+
+
+def test_initial_state_cache_key_rejects_config_and_prompt_aliases(tmp_path):
+    first_path = tmp_path / "first.wav"
+    second_path = tmp_path / "second.wav"
+    _write_prompt_wav(first_path, sample_rate=16000)
+    _write_prompt_wav(second_path, sample_rate=24000)
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(
+        token2wav,
+        initial_state_cache_enabled=True,
+        initial_state_cache_max_entries=8,
+    )
+    first_features = adapter.prepare_prompt("voice", str(first_path))
+
+    first_key = adapter._initial_state_cache_key(
+        first_features,
+        prompt_cache_id="voice",
+        prompt_wav=str(first_path),
+    )
+    other_id = adapter._initial_state_cache_key(
+        first_features,
+        prompt_cache_id="other",
+        prompt_wav=str(first_path),
+    )
+    other_sample_rate = adapter._initial_state_cache_key(
+        first_features,
+        prompt_cache_id="voice",
+        prompt_wav=str(second_path),
+    )
+    adapter.n_timesteps += 1
+    other_steps = adapter._initial_state_cache_key(
+        first_features,
+        prompt_cache_id="voice",
+        prompt_wav=str(first_path),
+    )
+    adapter.n_timesteps -= 1
+
+    class _FakePreLookahead:
+        pre_lookahead_len = 5
+
+    token2wav.flow.encoder.pre_lookahead_layer = _FakePreLookahead()
+    other_lookahead = adapter._initial_state_cache_key(
+        first_features,
+        prompt_cache_id="voice",
+        prompt_wav=str(first_path),
+    )
+
+    assert len({first_key, other_id, other_sample_rate, other_steps, other_lookahead}) == 5
+    assert first_key.prompt_sample_rate == 16000
+    assert other_sample_rate.prompt_sample_rate == 24000
+
+
+def test_initial_state_cache_digest_detects_in_place_prompt_change(tmp_path):
+    prompt_path = tmp_path / "default.wav"
+    _write_prompt_wav(prompt_path)
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(
+        token2wav,
+        initial_state_cache_enabled=True,
+        initial_state_cache_max_entries=2,
+    )
+    features = adapter.prepare_prompt("default", str(prompt_path))
+    first_key = adapter._initial_state_cache_key(
+        features,
+        prompt_cache_id="default",
+        prompt_wav=str(prompt_path),
+    )
+    prompt_path.write_bytes(prompt_path.read_bytes() + b"changed")
+    second_key = adapter._initial_state_cache_key(
+        features,
+        prompt_cache_id="default",
+        prompt_wav=str(prompt_path),
+    )
+
+    assert first_key.prompt_sha256 != second_key.prompt_sha256
+
+
+def test_initial_state_cache_lru_and_prompt_evict(tmp_path):
+    paths = [tmp_path / f"prompt-{index}.wav" for index in range(3)]
+    for index, path in enumerate(paths):
+        _write_prompt_wav(path, sample_rate=16000 + index)
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(
+        token2wav,
+        initial_state_cache_enabled=True,
+        initial_state_cache_max_entries=2,
+    )
+
+    for index, path in enumerate(paths):
+        features = adapter.prepare_prompt(f"voice-{index}", str(path))
+        adapter.setup_batch(
+            features,
+            1,
+            prompt_cache_id=f"voice-{index}",
+            prompt_wav=str(path),
+            allow_initial_state_cache=True,
+        )
+
+    keys = list(adapter._initial_state_templates)
+    assert [key.prompt_cache_id for key in keys] == ["voice-1", "voice-2"]
+    adapter.evict_prompt("voice-1", str(paths[1]))
+    assert [key.prompt_cache_id for key in adapter._initial_state_templates] == ["voice-2"]
+
+
+def test_initial_state_cache_failure_never_publishes_template(tmp_path, monkeypatch):
+    prompt_path = tmp_path / "default.wav"
+    _write_prompt_wav(prompt_path)
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(
+        token2wav,
+        initial_state_cache_enabled=True,
+        initial_state_cache_max_entries=1,
+    )
+    features = adapter.prepare_prompt("default", str(prompt_path))
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("injected setup failure")
+
+    monkeypatch.setattr(adapter, "_setup_batch_uncached", fail)
+    with pytest.raises(RuntimeError, match="injected setup failure"):
+        adapter.setup_batch(
+            features,
+            1,
+            prompt_cache_id="default",
+            prompt_wav=str(prompt_path),
+            allow_initial_state_cache=True,
+        )
+
+    assert adapter._initial_state_templates == {}
+
+
+def test_initial_state_cache_perf_stats_are_host_only(tmp_path):
+    prompt_path = tmp_path / "default.wav"
+    _write_prompt_wav(prompt_path)
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(
+        token2wav,
+        initial_state_cache_enabled=True,
+        initial_state_cache_max_entries=1,
+        perf_stats=True,
+    )
+    features = adapter.prepare_prompt("default", str(prompt_path))
+    MINICPMO45_PERF_STATS.reset()
+
+    for _ in range(2):
+        adapter.setup_batch(
+            features,
+            1,
+            prompt_cache_id="default",
+            prompt_wav=str(prompt_path),
+            allow_initial_state_cache=True,
+        )
+
+    stats = MINICPMO45_PERF_STATS.snapshot()
+    assert stats["initial_state_cache_miss_count"] == 1
+    assert stats["initial_state_cache_hit_count"] == 1
+    assert stats["initial_state_setup_ns"] >= 0
+    assert stats["initial_state_clone_ns"] >= 0
+
+
 def test_model_preserves_output_slots_and_prefers_runtime_codes():
     model, token2wav = _model()
     output = _forward(
@@ -371,6 +683,57 @@ def test_initial_empty_segment_marker_initializes_stream_without_audio():
 
     assert output.multimodal_outputs["model_outputs"][0].numel() > 0
     assert "duplex" in model._states
+
+
+def test_code2wav_cache_only_qualifies_official_default_prompt(tmp_path):
+    prompt_path = tmp_path / "default.wav"
+    _write_prompt_wav(prompt_path)
+    model, _ = _model(initial_state_cache=True)
+    model._default_prompt_id = "default"
+    model._default_prompt_wav = str(prompt_path)
+
+    default = _info("default-request", 0, [10, 11])
+    default["meta"]["prompt_cache_id"] = "default"
+    default["meta"]["prompt_wav"] = str(prompt_path)
+    _forward(model, [default])
+    assert len(model.backend._initial_state_templates) == 1
+
+    custom_path = tmp_path / "custom.wav"
+    _write_prompt_wav(custom_path)
+    custom = _info("custom-request", 0, [12, 13])
+    custom["meta"]["prompt_cache_id"] = "custom"
+    custom["meta"]["prompt_wav"] = str(custom_path)
+    _forward(model, [custom])
+    assert len(model.backend._initial_state_templates) == 1
+
+    runtime = _info("runtime-request", 0, [14, 15])
+    runtime["codes"]["ref"] = torch.tensor([0.0, 0.25, -0.25, 0.0])
+    runtime["meta"]["ref_audio_sr"] = 16000
+    runtime["meta"].pop("prompt_cache_id")
+    _forward(model, [runtime])
+    assert len(model.backend._initial_state_templates) == 1
+
+
+def test_initial_state_cache_soak_keeps_template_and_request_maps_bounded(
+    tmp_path,
+):
+    prompt_path = tmp_path / "default.wav"
+    _write_prompt_wav(prompt_path)
+    model, _ = _model(initial_state_cache=True)
+    model._default_prompt_id = "default"
+    model._default_prompt_wav = str(prompt_path)
+
+    for index in range(100):
+        info = _info(f"request-{index}", 0, [10, 11], last_chunk=True)
+        info["meta"]["prompt_cache_id"] = "default"
+        info["meta"]["prompt_wav"] = str(prompt_path)
+        _forward(model, [info])
+        model.on_requests_finished([f"request-{index}"])
+
+    assert len(model.backend._initial_state_templates) == 1
+    assert model._states == {}
+    assert model._request_prompt_keys == {}
+    assert model._runtime_prompts == {}
 
 
 def test_shared_runtime_prompt_recreates_missing_file_before_second_owner(tmp_path, monkeypatch):

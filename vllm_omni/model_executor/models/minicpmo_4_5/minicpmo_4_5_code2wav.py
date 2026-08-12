@@ -24,8 +24,10 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from .batched_token2wav import (
     BatchedToken2Wav,
     BatchedToken2WavState,
+    PromptFeatures,
     state_shape_signature,
 )
+from .optimization_config import MINICPMO45_OPTIMIZATION_CONFIG
 
 logger = init_logger(__name__)
 
@@ -126,6 +128,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         super().__init__()
         del prefix
         self.vllm_config = vllm_config
+        self._optimization_config = MINICPMO45_OPTIMIZATION_CONFIG
         self.model_path = str(vllm_config.model_config.model)
         self.backend: BatchedToken2Wav | None = None
         self._states: dict[str, _RequestState] = {}
@@ -183,6 +186,30 @@ class MiniCPMO45Code2Wav(nn.Module):
         else:
             extra = getattr(connector, "extra", None)
         return dict(extra) if isinstance(extra, Mapping) else {}
+
+    def _allow_initial_state_cache(self, item: _WorkItem) -> bool:
+        """Only the configured official default voice may reuse a template."""
+        if not self._optimization_config.initial_state_cache:
+            return False
+        if item.runtime_prompt_key is not None:
+            return False
+        return item.prompt_cache_id == self._default_prompt_id and Path(item.prompt_wav).expanduser().resolve(
+            strict=False
+        ) == Path(self._default_prompt_wav).expanduser().resolve(strict=False)
+
+    def _setup_initial_states(
+        self,
+        features: PromptFeatures,
+        bucket: list[_WorkItem],
+    ) -> list[BatchedToken2WavState]:
+        first = bucket[0]
+        return self.backend.setup_batch(
+            features,
+            len(bucket),
+            prompt_cache_id=first.prompt_cache_id,
+            prompt_wav=first.prompt_wav,
+            allow_initial_state_cache=self._allow_initial_state_cache(first),
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return torch.zeros((input_ids.numel(), 1), device=input_ids.device, dtype=torch.float32)
@@ -612,7 +639,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                     bucket[0].prompt_cache_id,
                     bucket[0].prompt_wav,
                 )
-                states = self.backend.setup_batch(features, len(bucket))
+                states = self._setup_initial_states(features, bucket)
             except Exception as exc:
                 self._prune_unowned_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
@@ -646,7 +673,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                     bucket[0].prompt_wav,
                 )
                 if bucket[0].previous is None:
-                    states = self.backend.setup_batch(features, batch_size)
+                    states = self._setup_initial_states(features, bucket)
                 else:
                     states = [item.previous.token2wav for item in bucket if item.previous is not None]
                 tokens = torch.stack([item.tokens for item in bucket], dim=0)
