@@ -42,6 +42,17 @@ SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT = (
     "matching the timbre, prosody, and speaking style of the reference audio while reading the new content clearly."
 )
 
+# MiniCPM-o's audio-assistant contract intentionally uses two text blocks with
+# the reference audio between them. Keep these strings stable so benchmark
+# requests are comparable across runs.
+SEED_TTS_MINICPM_VOICE_CLONE_INSTRUCTION = "模仿音频样本的音色并生成新的内容。"
+SEED_TTS_MINICPM_TTS_BEHAVIOR_INSTRUCTION = (
+    "你的任务是用这种声音模式来当一个助手。请认真、高质量地回复用户的问题。"
+    "请用高自然度的方式和用户聊天。你是由面壁智能开发的人工智能助手：面壁小钢炮。"
+)
+
+SEED_TTS_REFERENCE_AUDIO_PLACEMENTS = frozenset({"body", "system-message"})
+
 
 @dataclass
 class SeedTTSSampleRequest(SampleRequest):
@@ -53,6 +64,9 @@ class SeedTTSSampleRequest(SampleRequest):
     seed_tts_locale: str = ""
     #: For ``openai-chat-omni``: becomes the chat ``system`` message (Qwen3-Omni + TTS behavior).
     seed_tts_system_prompt: str = ""
+    #: ``body`` preserves speech-API fields; ``system-message`` uses MiniCPM's
+    #: audio-assistant chat message contract.
+    seed_tts_reference_audio_placement: str = "body"
     #: Local path to reference prompt WAV (for SIM vs. synthesized PCM in ``seed_tts_eval``).
     seed_tts_ref_wav_path: str = ""
     #: Ordered text targets evaluated as turns in one Realtime session.
@@ -160,6 +174,8 @@ class SeedTTSDataset(BenchmarkDataset):
         seed_tts_root: Optional override for the root directory (same layout as HF dataset).
         system_prompt: Optional override for the chat system message when using
             ``--backend openai-chat-omni``; defaults to :data:`SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT`.
+        reference_audio_placement: ``body`` keeps the legacy speech fields;
+            ``system-message`` embeds the reference audio in the system turn.
     """
 
     IS_MULTIMODAL = False
@@ -173,6 +189,7 @@ class SeedTTSDataset(BenchmarkDataset):
         inline_ref_audio: bool = True,
         seed_tts_root: str | None = None,
         system_prompt: str | None = None,
+        reference_audio_placement: str = "body",
         disable_shuffle: bool = False,
         **kwargs: Any,
     ) -> None:
@@ -181,6 +198,10 @@ class SeedTTSDataset(BenchmarkDataset):
         self.locale = locale
         self.inline_ref_audio = inline_ref_audio
         self._explicit_root = seed_tts_root
+        if reference_audio_placement not in SEED_TTS_REFERENCE_AUDIO_PLACEMENTS:
+            choices = ", ".join(sorted(SEED_TTS_REFERENCE_AUDIO_PLACEMENTS))
+            raise ValueError(f"reference_audio_placement must be one of: {choices}")
+        self.reference_audio_placement = reference_audio_placement
         sp = (system_prompt or "").strip()
         self._system_prompt = sp if sp else SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT
         super().__init__(
@@ -275,6 +296,7 @@ class SeedTTSDataset(BenchmarkDataset):
                     seed_tts_utterance_id=turns[0].utterance_id,
                     seed_tts_locale=self.locale,
                     seed_tts_system_prompt=self._system_prompt,
+                    seed_tts_reference_audio_placement=self.reference_audio_placement,
                     seed_tts_ref_wav_path=str(reference_wav_path),
                     seed_tts_turns=turns,
                 )
@@ -417,6 +439,7 @@ class SeedTTSDesignDataset(SeedTTSDataset):
                     seed_tts_utterance_id=row.utterance_id,
                     seed_tts_locale=self.locale,
                     seed_tts_system_prompt=self._system_prompt,
+                    seed_tts_reference_audio_placement=self.reference_audio_placement,
                     seed_tts_ref_wav_path="",  # SIM skipped for voice-design
                 )
             )
@@ -499,6 +522,7 @@ class SeedTTSTextDataset(SeedTTSDataset):
                     seed_tts_utterance_id=row.utterance_id,
                     seed_tts_locale=self.locale,
                     seed_tts_system_prompt=self._system_prompt,
+                    seed_tts_reference_audio_placement=self.reference_audio_placement,
                     seed_tts_ref_wav_path="",  # empty → SIM skipped in seed_tts_eval
                 )
             )

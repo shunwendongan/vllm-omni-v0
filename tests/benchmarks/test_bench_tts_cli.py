@@ -59,6 +59,57 @@ def test_indextts25_is_registered_in_shared_model_configs() -> None:
     assert config["task_extra_body"]["voice_clone"]["extra_params"]["lang"] == "en"
 
 
+def test_minicpmo45_is_registered_with_seed_tts_chat_contract() -> None:
+    config_path = Path(bench_tts.__file__).with_name("model_configs.yaml")
+    config = bench_tts.load_model_configs(config_path)["openbmb/MiniCPM-o-4_5"]
+
+    assert config["supported_tasks"] == ["voice_clone"]
+    assert config["backend"] == "openai-chat-omni"
+    assert config["endpoint"] == "/v1/chat/completions"
+    assert config["seed_tts_reference_audio_placement"] == "system-message"
+    assert config["task_extra_body"]["voice_clone"] == {
+        "modalities": ["text", "audio"],
+        "chat_template_kwargs": {
+            "use_tts_template": True,
+            "enable_thinking": False,
+        },
+    }
+
+
+def test_build_bench_args_minicpmo45_selects_system_message_contract() -> None:
+    config_path = Path(bench_tts.__file__).with_name("model_configs.yaml")
+    model_cfg = bench_tts.load_model_configs(config_path)["openbmb/MiniCPM-o-4_5"]
+
+    cmd = bench_tts.build_bench_args(
+        host="localhost",
+        port=8099,
+        model="openbmb/MiniCPM-o-4_5",
+        task="voice_clone",
+        model_cfg=model_cfg,
+        locale="en",
+        num_prompts=10,
+        concurrency=1,
+        dataset_path="/data/seed-tts",
+        wer_eval=False,
+        output_dir=None,
+        result_filename=None,
+        extra_cli_args=[],
+    )
+
+    assert cmd[cmd.index("--backend") + 1] == "openai-chat-omni"
+    assert cmd[cmd.index("--endpoint") + 1] == "/v1/chat/completions"
+    placement = cmd.index("--seed-tts-reference-audio-placement")
+    assert cmd[placement + 1] == "system-message"
+    extra_body = json.loads(cmd[cmd.index("--extra-body") + 1])
+    assert extra_body == {
+        "modalities": ["text", "audio"],
+        "chat_template_kwargs": {
+            "use_tts_template": True,
+            "enable_thinking": False,
+        },
+    }
+
+
 def test_build_bench_args_voice_clone(model_configs_path: Path) -> None:
     configs = bench_tts.load_model_configs(model_configs_path)
     cmd = bench_tts.build_bench_args(

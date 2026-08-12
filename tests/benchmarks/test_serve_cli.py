@@ -56,6 +56,11 @@ def test_extend_omni_choices_updates_tracking_parser_shadow(dataset_name: str) -
         (["--print-stage"], "print_stage", True),
         (["--daily-omni-input-mode", "audio"], "daily_omni_input_mode", "audio"),
         (["--seed-tts-locale", "zh"], "seed_tts_locale", "zh"),
+        (
+            ["--seed-tts-reference-audio-placement", "system-message"],
+            "seed_tts_reference_audio_placement",
+            "system-message",
+        ),
     ],
 )
 def test_add_omni_args_registers_arguments_on_tracking_parser(
@@ -81,7 +86,16 @@ def test_add_omni_args_preserves_implicit_defaults() -> None:
     assert args.print_stage is False
     assert args.daily_omni_input_mode == "all"
     assert args.seed_tts_locale == "en"
+    assert args.seed_tts_reference_audio_placement == "body"
     assert args.explicit_keys == set()
+
+
+def test_seed_tts_reference_audio_placement_rejects_invalid_value() -> None:
+    parser = TrackingArgumentParser()
+    add_omni_args(parser)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--seed-tts-reference-audio-placement", "top-level"])
 
 
 def test_update_omni_help_updates_upstream_actions() -> None:

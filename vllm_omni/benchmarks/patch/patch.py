@@ -42,6 +42,8 @@ from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDatase
 from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
+    SEED_TTS_MINICPM_TTS_BEHAVIOR_INSTRUCTION,
+    SEED_TTS_MINICPM_VOICE_CLONE_INSTRUCTION,
     SeedTTSDataset,
     SeedTTSDesignDataset,
     SeedTTSSampleRequest,
@@ -198,15 +200,31 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
     setattr(rfi, "seed_tts_system_prompt", sys_prompt)
     setattr(rfi, "seed_tts_speech_extra", sample.seed_tts_speech_extra)
     setattr(rfi, "seed_tts_turns", sample.seed_tts_turns)
+    placement = sample.seed_tts_reference_audio_placement
+    setattr(rfi, "seed_tts_reference_audio_placement", placement)
+    ex = sample.seed_tts_speech_extra
+    if placement == "system-message":
+        if not isinstance(ex, dict) or not ex.get("ref_audio"):
+            raise ValueError("system-message reference audio placement requires Seed-TTS ref_audio")
+        system_content = [
+            {"type": "text", "text": SEED_TTS_MINICPM_VOICE_CLONE_INSTRUCTION},
+            {"type": "audio_url", "audio_url": {"url": ex["ref_audio"]}},
+            {"type": "text", "text": SEED_TTS_MINICPM_TTS_BEHAVIOR_INSTRUCTION},
+        ]
+    else:
+        system_content = [{"type": "text", "text": sys_prompt}]
     setattr(
         rfi,
         "omni_chat_messages",
         [
-            {"role": "system", "content": [{"type": "text", "text": sys_prompt}]},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": [{"type": "text", "text": sample.prompt}]},
         ],
     )
-    ex = sample.seed_tts_speech_extra
+    if placement == "system-message":
+        # MiniCPM consumes the reference through the system turn. In
+        # particular, do not leak speech-API-only fields into ChatCompletion.
+        return
     if not ex:
         return  # voice comes from --extra-body in config; no ref_audio to merge
     base = dict(rfi.extra_body) if rfi.extra_body else {}
@@ -349,6 +367,13 @@ def get_samples(args, tokenizer):
         return input_requests
 
     if is_seed_tts:
+        reference_audio_placement = getattr(args, "seed_tts_reference_audio_placement", "body")
+        if reference_audio_placement == "system-message" and args.dataset_name != "seed-tts":
+            raise ValueError(
+                "--seed-tts-reference-audio-placement system-message is only valid with --dataset-name seed-tts."
+            )
+        if reference_audio_placement == "system-message" and args.backend != "openai-chat-omni":
+            raise ValueError("--seed-tts-reference-audio-placement system-message requires --backend openai-chat-omni.")
         if args.backend not in (
             "openai-audio-speech",
             "openai-chat-omni",
@@ -392,6 +417,7 @@ def get_samples(args, tokenizer):
             inline_ref_audio=not getattr(args, "seed_tts_file_ref_audio", False),
             seed_tts_root=getattr(args, "seed_tts_root", None),
             system_prompt=getattr(args, "seed_tts_system_prompt", None),
+            reference_audio_placement=reference_audio_placement,
             disable_shuffle=getattr(args, "disable_shuffle", False),
         )
         out_len = getattr(args, "output_len", None)

@@ -106,6 +106,29 @@ def test_seed_tts_dataset_groups_four_turns_with_one_reference(seed_tts_root, mo
     assert request.seed_tts_ref_wav_path.endswith("utt000.wav")
 
 
+def test_seed_tts_dataset_carries_system_message_placement(seed_tts_root, mock_tokenizer):
+    ds = SeedTTSDataset(
+        dataset_path=str(seed_tts_root),
+        random_seed=0,
+        locale="en",
+        reference_audio_placement="system-message",
+        disable_shuffle=True,
+    )
+
+    request = ds.sample(mock_tokenizer, num_requests=1, no_oversample=True)[0]
+
+    assert request.seed_tts_reference_audio_placement == "system-message"
+    assert request.seed_tts_speech_extra["ref_audio"].startswith("data:audio/wav;base64,")
+
+
+def test_seed_tts_dataset_rejects_invalid_reference_audio_placement(seed_tts_root):
+    with pytest.raises(ValueError, match="reference_audio_placement must be one of"):
+        SeedTTSDataset(
+            dataset_path=str(seed_tts_root),
+            reference_audio_placement="top-level",
+        )
+
+
 def test_seed_tts_eval_expands_grouped_pcm_by_turn():
     from vllm_omni.benchmarks.data_modules.seed_tts_eval import (
         _expand_seed_tts_turn_outputs,

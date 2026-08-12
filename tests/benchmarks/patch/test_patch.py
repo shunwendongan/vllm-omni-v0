@@ -17,6 +17,7 @@ from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
+    _attach_seed_tts_to_request_func_input,
     async_request_openai_chat_omni_completions,
     async_request_openai_realtime_duplex,
 )
@@ -46,6 +47,151 @@ class MockResponse:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         pass
+
+
+def _seed_tts_request_input(*, extra_body=None):
+    return RequestFuncInput(
+        model="openbmb/MiniCPM-o-4_5",
+        model_name="openbmb/MiniCPM-o-4_5",
+        prompt="target text",
+        api_url="http://localhost:8000/v1/chat/completions",
+        prompt_len=2,
+        output_len=20,
+        extra_body=extra_body,
+    )
+
+
+def test_seed_tts_system_message_orders_reference_audio_without_body_leakage():
+    from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
+        SEED_TTS_MINICPM_TTS_BEHAVIOR_INSTRUCTION,
+        SEED_TTS_MINICPM_VOICE_CLONE_INSTRUCTION,
+        SeedTTSSampleRequest,
+    )
+
+    sample = SeedTTSSampleRequest(
+        prompt="target text",
+        prompt_len=2,
+        expected_output_len=20,
+        multi_modal_data=None,
+        request_id="seed-0",
+        seed_tts_speech_extra={
+            "ref_audio": "data:audio/wav;base64,AAAA",
+            "ref_text": "reference transcript",
+            "task_type": "Base",
+            "language": "English",
+            "max_new_tokens": 20,
+        },
+        seed_tts_reference_audio_placement="system-message",
+    )
+    request_input = _seed_tts_request_input(
+        extra_body={
+            "modalities": ["text", "audio"],
+            "chat_template_kwargs": {"use_tts_template": True, "enable_thinking": False},
+        }
+    )
+
+    _attach_seed_tts_to_request_func_input(sample, request_input)
+
+    assert request_input.omni_chat_messages == [
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": SEED_TTS_MINICPM_VOICE_CLONE_INSTRUCTION},
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": "data:audio/wav;base64,AAAA"},
+                },
+                {"type": "text", "text": SEED_TTS_MINICPM_TTS_BEHAVIOR_INSTRUCTION},
+            ],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "target text"}]},
+    ]
+    assert request_input.extra_body == {
+        "modalities": ["text", "audio"],
+        "chat_template_kwargs": {"use_tts_template": True, "enable_thinking": False},
+    }
+    assert not {"ref_audio", "ref_text", "task_type", "language"} & request_input.extra_body.keys()
+
+
+def test_seed_tts_body_placement_preserves_existing_contract():
+    from vllm_omni.benchmarks.data_modules.seed_tts_dataset import SeedTTSSampleRequest
+
+    sample = SeedTTSSampleRequest(
+        prompt="target text",
+        prompt_len=2,
+        expected_output_len=20,
+        multi_modal_data=None,
+        request_id="seed-0",
+        seed_tts_speech_extra={
+            "ref_audio": "data:audio/wav;base64,AAAA",
+            "ref_text": "reference transcript",
+            "task_type": "Base",
+            "language": "English",
+        },
+    )
+    request_input = _seed_tts_request_input(extra_body={"custom": True})
+
+    _attach_seed_tts_to_request_func_input(sample, request_input)
+
+    assert request_input.omni_chat_messages[0]["content"] == [
+        {
+            "type": "text",
+            "text": request_input.seed_tts_system_prompt,
+        }
+    ]
+    assert request_input.extra_body == {
+        "custom": True,
+        "ref_audio": "data:audio/wav;base64,AAAA",
+        "ref_text": "reference transcript",
+        "task_type": "Base",
+        "language": "English",
+    }
+
+
+@pytest.mark.asyncio
+async def test_seed_tts_system_message_payload_has_fixed_tts_fields(mocker: MockerFixture):
+    request_input = _seed_tts_request_input(
+        extra_body={
+            "modalities": ["text", "audio"],
+            "chat_template_kwargs": {"use_tts_template": True, "enable_thinking": False},
+        }
+    )
+    request_input.seed_tts_row = True
+    request_input.omni_chat_messages = [
+        {"role": "system", "content": [{"type": "text", "text": "clone"}]},
+        {"role": "user", "content": [{"type": "text", "text": "target text"}]},
+    ]
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=MockResponse(200, [b"data: [DONE]\n\n"]))
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is True
+    payload = mock_session.post.call_args.kwargs["json"]
+    assert payload["messages"] == request_input.omni_chat_messages
+    assert payload["modalities"] == ["text", "audio"]
+    assert payload["chat_template_kwargs"] == {
+        "use_tts_template": True,
+        "enable_thinking": False,
+    }
+    assert not {"ref_audio", "ref_text", "task_type", "language"} & payload.keys()
+
+
+def test_seed_tts_system_message_requires_reference_audio():
+    from vllm_omni.benchmarks.data_modules.seed_tts_dataset import SeedTTSSampleRequest
+
+    sample = SeedTTSSampleRequest(
+        prompt="target text",
+        prompt_len=2,
+        expected_output_len=20,
+        multi_modal_data=None,
+        request_id="seed-0",
+        seed_tts_speech_extra={"ref_text": "reference transcript"},
+        seed_tts_reference_audio_placement="system-message",
+    )
+
+    with pytest.raises(ValueError, match="requires Seed-TTS ref_audio"):
+        _attach_seed_tts_to_request_func_input(sample, _seed_tts_request_input())
 
 
 @pytest.mark.asyncio

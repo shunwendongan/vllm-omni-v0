@@ -135,6 +135,10 @@ def build_bench_args(
     if locale:
         cmd += ["--seed-tts-locale", locale]
 
+    reference_audio_placement = model_cfg.get("seed_tts_reference_audio_placement")
+    if reference_audio_placement:
+        cmd += ["--seed-tts-reference-audio-placement", str(reference_audio_placement)]
+
     if task_extra_body:
         cmd += ["--extra-body", json.dumps(task_extra_body, separators=(",", ":"))]
 
