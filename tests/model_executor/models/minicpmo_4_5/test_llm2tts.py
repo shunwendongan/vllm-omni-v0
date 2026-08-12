@@ -25,6 +25,10 @@ import torch
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.optimization_config import (
+    MINICPMO45_PERF_STATS,
+    MiniCPMO45OptimizationConfig,
+)
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import llm2tts
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -137,6 +141,56 @@ class TestInputValidation:
 
 
 class TestBasicShape:
+    def test_tensor_handoff_preserves_fp32_contiguous_tensor(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.MINICPMO45_OPTIMIZATION_CONFIG",
+            MiniCPMO45OptimizationConfig(tensor_handoff=True),
+        )
+        hidden = torch.arange(12, dtype=torch.float64).reshape(_HIDDEN_DIM, 3).T.requires_grad_()
+
+        result = llm2tts(
+            [_make_thinker_output(prompt_token_ids=[10], output_token_ids=[20, 21], hidden_states=hidden)],
+            prompt=None,
+        )[0]
+        handoff = result["model_intermediate_buffer"]["hidden_states"]["tts"]
+
+        assert isinstance(handoff, torch.Tensor)
+        assert handoff.dtype == torch.float32
+        assert handoff.is_contiguous()
+        assert handoff.requires_grad is False
+        assert torch.equal(handoff, hidden[1:].to(torch.float32))
+
+    def test_tensor_and_legacy_handoffs_have_identical_values(self, monkeypatch) -> None:
+        hidden = torch.arange(12, dtype=torch.float32).reshape(3, _HIDDEN_DIM)
+        source = _make_thinker_output(prompt_token_ids=[10], output_token_ids=[20, 21], hidden_states=hidden)
+
+        legacy = llm2tts([source], prompt=None)[0]["model_intermediate_buffer"]["hidden_states"]["tts"]
+        monkeypatch.setattr(
+            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.MINICPMO45_OPTIMIZATION_CONFIG",
+            MiniCPMO45OptimizationConfig(tensor_handoff=True),
+        )
+        tensor = llm2tts([source], prompt=None)[0]["model_intermediate_buffer"]["hidden_states"]["tts"]
+
+        assert torch.equal(torch.as_tensor(legacy), tensor)
+
+    def test_perf_stats_count_selected_handoff_without_device_sync(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.MINICPMO45_OPTIMIZATION_CONFIG",
+            MiniCPMO45OptimizationConfig(tensor_handoff=True, perf_stats=True),
+        )
+        MINICPMO45_PERF_STATS.reset()
+        hidden = torch.zeros((2, _HIDDEN_DIM))
+
+        llm2tts(
+            [_make_thinker_output(prompt_token_ids=[10], output_token_ids=[20], hidden_states=hidden)],
+            prompt=None,
+        )
+
+        stats = MINICPMO45_PERF_STATS.snapshot()
+        assert stats["tensor_handoff_count"] == 1
+        assert stats["legacy_handoff_count"] == 0
+        assert stats["handoff_prepare_ns"] >= 0
+
     def test_request_level_multimodal_output_feeds_orchestrator_bridge(self) -> None:
         hidden = torch.zeros((2, _HIDDEN_DIM))
         thinker_output = _make_thinker_output(

@@ -11,14 +11,17 @@ from unittest.mock import ANY, AsyncMock, MagicMock
 
 import janus
 import pytest
+import torch
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
+from vllm.v1.engine import EngineCoreRequest
 
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
     _OrchestratorDuplexStagePort,
 )
+from vllm_omni.engine.serialization import deserialize_model_intermediate_buffer
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.experimental.fullduplex.engine.contracts import (
     DuplexStageRequestContext,
@@ -237,6 +240,73 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
     submitted_request = stage1.add_request_calls[0][0]
     assert submitted_request.prompt_token_ids == [101, 102]
     assert submitted_request.external_req_id == "req-text"
+
+
+@pytest.mark.asyncio
+async def test_processed_stage_request_preserves_tensor_model_buffer() -> None:
+    class TensorBufferInputProcessor:
+        def process_inputs(self, **kwargs):
+            return EngineCoreRequest(
+                request_id=kwargs["request_id"],
+                prompt_token_ids=[101, 102],
+                mm_features=None,
+                sampling_params=kwargs["params"],
+                pooling_params=None,
+                arrival_time=kwargs["arrival_time"],
+                lora_request=None,
+                cache_salt=None,
+                data_parallel_rank=None,
+            )
+
+    stage0 = FakeStageClient(final_output=False)
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    stage1 = FakeStageClient(
+        final_output=False,
+        next_inputs=[
+            {
+                "prompt": "speech",
+                "model_intermediate_buffer": {
+                    "ids": {"tts": [11, 12]},
+                    "hidden_states": {"tts": hidden},
+                },
+            }
+        ],
+    )
+    stage_pools = [
+        StagePool(
+            0,
+            [stage0],
+            output_processor=FakeOutputProcessor(),
+            stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        ),
+        StagePool(
+            1,
+            [stage1],
+            output_processor=FakeOutputProcessor(),
+            stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        ),
+    ]
+    orchestrator = Orchestrator(
+        request_async_queue=janus.Queue().async_q,
+        output_async_queue=janus.Queue().async_q,
+        rpc_async_queue=janus.Queue().async_q,
+        stage_pools=stage_pools,
+        async_chunk=False,
+    )
+    orchestrator._stage_input_processors[1] = TensorBufferInputProcessor()
+    req_state = OrchestratorRequestState(
+        request_id="req-buffer",
+        sampling_params_list=[SamplingParams(max_tokens=1), SamplingParams(max_tokens=1)],
+        final_stage_id=1,
+    )
+
+    await orchestrator._forward_to_next_stage("req-buffer", 0, _request_output("req-buffer"), req_state)
+
+    submitted_request = stage1.add_request_calls[0][0]
+    restored = deserialize_model_intermediate_buffer(submitted_request.model_intermediate_buffer)
+    assert restored is not None
+    assert restored["ids"]["tts"] == [11, 12]
+    assert torch.equal(restored["hidden_states"]["tts"], hidden)
 
 
 @pytest.mark.asyncio

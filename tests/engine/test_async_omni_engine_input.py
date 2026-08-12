@@ -7,6 +7,7 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
+from vllm_omni.engine.serialization import deserialize_model_intermediate_buffer
 from vllm_omni.engine.stage_pool import StagePool
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -102,7 +103,8 @@ def test_build_add_request_message_preserves_model_intermediate_buffer(mocker: M
     assert request.additional_information.entries["global_request_id"].list_data == ["req-1"]
     assert request.additional_information.entries["omni_final_stage_id"].scalar_data == 0
     assert isinstance(request.model_intermediate_buffer, dict)
-    info = request.model_intermediate_buffer
+    info = deserialize_model_intermediate_buffer(request.model_intermediate_buffer)
+    assert info is not None
     assert info["ids"]["tts"] == [11, 12]
     assert torch.equal(info["hidden_states"]["tts"], hidden)
 
