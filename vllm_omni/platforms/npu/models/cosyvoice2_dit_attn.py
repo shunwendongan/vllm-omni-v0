@@ -18,7 +18,7 @@ This module:
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager
 
 import torch
 import torch.nn.functional as F
@@ -52,6 +52,13 @@ def _expand_attn_mask_for_npu(
 
 
 def _patched_attention_forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+    # NPU FP16: cast input to weight dtype so that all Linear/Norm/SDPA
+    # operations use consistent types.  Without this, fp32 inputs entering
+    # fp16-weight Attention layers produce mixed-dtype SDPA errors.
+    target_dtype = self.to_q.weight.dtype
+    if x.dtype != target_dtype:
+        x = x.to(target_dtype)
+
     b, t, c = x.shape
 
     q = self.to_heads(self.to_q(x))
@@ -81,6 +88,13 @@ def _patched_attention_forward_chunk(
     att_cache: torch.Tensor | None = None,
     attn_mask: torch.Tensor | None = None,
 ):
+    # NPU FP16: cast input & cache to weight dtype for consistent SDPA.
+    target_dtype = self.to_q.weight.dtype
+    if x.dtype != target_dtype:
+        x = x.to(target_dtype)
+    if att_cache is not None and att_cache.dtype != target_dtype:
+        att_cache = att_cache.to(target_dtype)
+
     b, t, c = x.shape
 
     q = self.to_heads(self.to_q(x))
@@ -107,17 +121,20 @@ def _patched_attention_forward_chunk(
 
 
 @contextmanager
-def npu_math_sdpa_context() -> Iterator[None]:
+def npu_math_sdpa_context(*, require_available: bool = False) -> Iterator[None]:
     """Force SDPA MATH backend so Ascend does not call fused FA."""
-    try:
-        from torch.nn.attention import SDPBackend, sdpa_kernel
+    with ExitStack() as stack:
+        try:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
 
-        with sdpa_kernel(SDPBackend.MATH):
-            yield
-    except Exception:
-        # Older torch / missing backend enum — just run as-is.
-        with nullcontext():
-            yield
+            stack.enter_context(sdpa_kernel(SDPBackend.MATH))
+        except Exception as exc:
+            if require_available:
+                raise RuntimeError(
+                    "MiniCPM-o Code2Wav NPU graph capture requires torch.nn.attention.sdpa_kernel(SDPBackend.MATH)"
+                ) from exc
+            logger.warning_once("MATH SDPA selection is unavailable; using the default Ascend SDPA backend.")
+        yield
 
 
 def _disable_upsample_encoder_compile() -> None:

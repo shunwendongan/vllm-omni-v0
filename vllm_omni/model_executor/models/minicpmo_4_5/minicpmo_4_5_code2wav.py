@@ -30,6 +30,23 @@ from .batched_token2wav import (
 logger = init_logger(__name__)
 
 
+def _get_token2wav_class() -> type[Any]:
+    """Resolve the Token2wav class, preferring the in-tree NPU adapter."""
+    from vllm_omni.platforms import current_omni_platform
+
+    if current_omni_platform.is_npu():
+        # NPU/Ascend: keep the in-tree NPU-aware adapter (HiFT linear downsample,
+        # DiT mask expand, MATH SDPA + FFT STFT fixes) at its original path.
+        from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
+            MiniCPMO45Token2wav,
+        )
+
+        return MiniCPMO45Token2wav
+    from stepaudio2.token2wav import Token2wav
+
+    return Token2wav
+
+
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
     payload = {"reason": reason, **details}
     return RuntimeError(f"MiniCPMO45Code2WavBatchError {json.dumps(payload, sort_keys=True)}")
@@ -310,11 +327,17 @@ class MiniCPMO45Code2Wav(nn.Module):
         normalized = [int(value) for value in counts]
         if any(value < 0 for value in normalized):
             raise _batch_error("negative_seq_token_count", counts=normalized)
-        if sum(normalized) != int(flat.numel()):
+        total = int(flat.numel())
+        expected = sum(normalized)
+        if expected < total:
+            # cudagraph/aclgraph decode pads the batch with trailing dummy tokens
+            # that are not codec data; trim them before segmenting.
+            flat = flat[:expected]
+        elif expected > total:
             raise _batch_error(
                 "seq_token_count_mismatch",
                 counts=normalized,
-                total=int(flat.numel()),
+                total=total,
             )
         return list(torch.split(flat, normalized))
 
@@ -740,18 +763,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         if self.backend is not None:
             return
 
-        from vllm_omni.platforms import current_omni_platform
-
-        if current_omni_platform.is_npu():
-            # NPU/Ascend: the external `stepaudio2` package hard-codes `.cuda()`,
-            # so use the in-tree NPU-aware adapter instead. It delegates to
-            # StepAudio2Token2WavCore, which auto-applies the Ascend fixes
-            # (HiFT linear downsample, DiT mask expand, MATH SDPA) on NPU.
-            from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
-                MiniCPMO45Token2wav as Token2wav,
-            )
-        else:
-            from stepaudio2.token2wav import Token2wav
+        Token2wav = _get_token2wav_class()
 
         extra = self._extra_config()
         model_root = self._resolve_model_root()
@@ -776,3 +788,42 @@ class MiniCPMO45Code2Wav(nn.Module):
         finally:
             torch.set_default_dtype(previous_dtype)
         self.backend = BatchedToken2Wav(token2wav)
+        self._maybe_warmup_hift()
+
+    def _maybe_warmup_hift(self) -> None:
+        """Run one representative HiFT inference before serving requests.
+
+        Gated by ``enable_hift_warmup`` in the stage extra config. The first
+        HiFT forward after loading pays a one-time kernel-compile /
+        weight-load cost (observed ~5.6s on Ascend 910C). Executing it here,
+        during model load and before the API is ready, moves that one-time
+        cost out of the first user request. Uses an independent cache source
+        so no real request state is touched.
+        """
+        extra = self._extra_config()
+        if not extra.get("enable_hift_warmup", False):
+            return
+        backend = getattr(self, "backend", None)
+        if backend is None:
+            return
+        hift = getattr(backend, "hift", None)
+        if hift is None:
+            return
+        device = next(hift.parameters()).device
+        dtype = next(hift.parameters()).dtype
+        # Representative first-chunk mel: [B=1, mel_bins=80, frames].
+        mel = torch.randn(1, 80, 86, device=device, dtype=dtype)
+        cache_source = torch.zeros(1, 1, 0, device=device, dtype=dtype)
+        try:
+            with torch.inference_mode():
+                hift(mel, cache_source)
+            torch.accelerator.synchronize(device)
+            logger.info("HiFT startup warmup done")
+        except Exception:
+            # Warmup is a performance optimization, not a correctness
+            # requirement; never block serving on it.
+            logger.warning(
+                "HiFT startup warmup failed; continuing with cold execution",
+                exc_info=True,
+            )
+        del mel, cache_source

@@ -3,8 +3,9 @@
 
 from __future__ import annotations
 
+import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import copy, deepcopy
 from typing import Any, NamedTuple
 
@@ -83,6 +84,164 @@ def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]
                 type(val).__name__,
             )
     return result
+
+
+def _clone_npu_tensor_payload(value: Any, sources: list[torch.Tensor]) -> Any:
+    """Clone NPU tensors on the current stream before async CPU copies."""
+    if isinstance(value, torch.Tensor):
+        if value.device.type == "npu":
+            cloned = value.detach().clone()
+            sources.append(cloned)
+            return cloned
+        return value.detach().clone()
+    if isinstance(value, dict):
+        return {k: _clone_npu_tensor_payload(v, sources) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clone_npu_tensor_payload(v, sources) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_npu_tensor_payload(v, sources) for v in value)
+    return value
+
+
+def _copy_tensor_payload_to_cpu(value: Any, pin_memory: bool) -> Any:
+    if isinstance(value, torch.Tensor):
+        if value.device.type != "npu":
+            return value
+        cpu = torch.empty_like(value, device="cpu", pin_memory=pin_memory)
+        cpu.copy_(value, non_blocking=True)
+        return cpu
+    if isinstance(value, dict):
+        return {k: _copy_tensor_payload_to_cpu(v, pin_memory) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_copy_tensor_payload_to_cpu(v, pin_memory) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_copy_tensor_payload_to_cpu(v, pin_memory) for v in value)
+    return value
+
+
+class _AsyncCPUPayloadSnapshot:
+    def __init__(
+        self,
+        payload: Any,
+        ready_event: "torch.npu.Event | None",
+        npu_sources: list[torch.Tensor],
+    ) -> None:
+        self.payload = payload
+        self._ready_event = ready_event
+        self._npu_sources = npu_sources
+        self._waited = False
+
+    def wait(self) -> None:
+        if self._waited:
+            return
+        if self._ready_event is not None:
+            self._ready_event.synchronize()
+        self._npu_sources.clear()
+        self._waited = True
+
+
+def _snapshot_tensor_payload_to_cpu_async(
+    value: Any,
+    *,
+    copy_stream: "torch.npu.Stream",
+    pin_memory: bool,
+) -> _AsyncCPUPayloadSnapshot:
+    npu_sources: list[torch.Tensor] = []
+    cloned = _clone_npu_tensor_payload(value, npu_sources)
+    if not npu_sources:
+        return _AsyncCPUPayloadSnapshot(cloned, None, npu_sources)
+
+    source_stream = torch.npu.current_stream()
+    ready_event = torch.npu.Event()
+    with torch.npu.stream(copy_stream):
+        copy_stream.wait_stream(source_stream)
+        cpu_payload = _copy_tensor_payload_to_cpu(cloned, pin_memory)
+        ready_event.record(copy_stream)
+    return _AsyncCPUPayloadSnapshot(cpu_payload, ready_event, npu_sources)
+
+
+class OmniAsyncNPUGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
+    """NPU port of OmniAsyncGPUModelRunnerOutput: build Omni output on a
+    background thread while the async D2H snapshot completes."""
+
+    def __init__(
+        self,
+        *,
+        model_runner_output_builder: Callable[[], "OmniModelRunnerOutput"],
+        npu_device: torch.device | int | str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        sampled_token_ids = kwargs.pop("sampled_token_ids")
+        logprobs_tensors = kwargs.pop("logprobs_tensors")
+        invalid_req_indices = kwargs.pop("invalid_req_indices")
+        async_output_copy_stream = kwargs.pop("async_output_copy_stream")
+        vocab_size = kwargs.pop("vocab_size")
+        routed_experts = kwargs.pop("routed_experts", None)
+        kwargs.pop("check_ep_fault", False)
+        if kwargs:
+            raise TypeError(f"Unexpected OmniAsyncNPUGPUModelRunnerOutput kwargs: {sorted(kwargs)}")
+
+        self._model_runner_output = None
+        self._invalid_req_indices = invalid_req_indices
+
+        self.async_copy_ready_event = torch.npu.Event()
+        self._sampled_token_ids = sampled_token_ids
+        self.vocab_size = vocab_size
+        self._logprobs_tensors = logprobs_tensors
+        self._routed_experts = routed_experts
+        self._has_fault: torch.Tensor | None = None
+
+        default_stream = torch.npu.current_stream()
+        with torch.npu.stream(async_output_copy_stream):
+            async_output_copy_stream.wait_stream(default_stream)
+            self.sampled_token_ids_cpu = self._sampled_token_ids.to("cpu", non_blocking=True)
+            self._logprobs_tensors_cpu = (
+                self._logprobs_tensors.to_cpu_nonblocking() if self._logprobs_tensors is not None else None
+            )
+            self._routed_experts_cpu = (
+                self._routed_experts.to_cpu_nonblocking() if self._routed_experts is not None else None
+            )
+            self.async_copy_ready_event.record()
+
+        self._model_runner_output_builder = model_runner_output_builder
+        self._background_exception: BaseException | None = None
+        self._background_thread: threading.Thread | None = None
+        self._npu_device = npu_device
+        self._background_thread = threading.Thread(
+            target=self._build_output_in_background,
+            daemon=True,
+            name="omni-async-npu-output-builder",
+        )
+        self._background_thread.start()
+
+    def _build_model_runner_output_once(self) -> None:
+        if self._model_runner_output is not None:
+            return
+        with record_function_or_nullcontext("omni_async_npu_output:get_output/build_model_runner_output"):
+            self._model_runner_output = self._model_runner_output_builder()
+        self._model_runner_output_builder = None
+
+    def _build_output_in_background(self) -> None:
+        try:
+            if self._npu_device is not None:
+                torch.npu.set_device(self._npu_device)
+            self._build_model_runner_output_once()
+        except BaseException as exc:  # noqa: BLE001 - re-raised by get_output().
+            self._background_exception = exc
+
+    def get_output(self) -> "OmniModelRunnerOutput":
+        background_thread = getattr(self, "_background_thread", None)
+        if background_thread is not None:
+            background_thread.join()
+            self._background_thread = None
+            background_exception = getattr(self, "_background_exception", None)
+            if background_exception is not None:
+                raise background_exception
+        self._build_model_runner_output_once()
+        if not hasattr(self, "_has_fault"):
+            self._has_fault = None
+        with record_function_or_nullcontext("omni_async_npu_output:get_output/finalize_async_sampled_tokens"):
+            return super().get_output()
 
 
 class ExecuteModelState(NamedTuple):
@@ -886,7 +1045,15 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         self.input_batch.idx_mapping_np,
                         self.input_batch.positions[self.input_batch.logits_indices],
                     )
-                prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
+                if getattr(self.model, "model_sampler_needs_output_token_ids", True) or not getattr(
+                    sampling_metadata, "no_penalties", False
+                ):
+                    prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
+                else:
+                    # Rebuilding decoded-token history costs a D2H sync + full
+                    # list copies per step; skip it for model samplers that
+                    # declare they never read it (unless penalties need it).
+                    prepared_sampling_metadata = sampling_metadata
                 self._apply_duplex_sampling(logits, prepared_sampling_metadata)
                 sampler_output = model_sample(logits, prepared_sampling_metadata)
                 if sampler_output is not None:
