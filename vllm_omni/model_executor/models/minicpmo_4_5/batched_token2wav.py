@@ -104,6 +104,7 @@ class BatchedToken2Wav(nn.Module):
             torch.accelerator.empty_cache()
         self.float16 = bool(token2wav.float16)
         self.n_timesteps = int(token2wav.n_timesteps)
+        self._timeline_cache: dict[tuple[int, str, int | None, torch.dtype], torch.Tensor] = {}
         self.mel_cache_len = int(token2wav.mel_cache_len)
         self.source_cache_len = int(token2wav.source_cache_len)
         self.register_buffer(
@@ -199,6 +200,27 @@ class BatchedToken2Wav(nn.Module):
         layer = getattr(self.flow.encoder, "pre_lookahead_layer", None)
         width = getattr(layer, "pre_lookahead_len", None)
         return int(width) if width is not None else None
+
+    def _cfm_timeline(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Return the immutable-by-convention CFM timeline for this execution.
+
+        The cached tensor is never exposed or mutated. Device indices are part
+        of ``str(device)``, so colocated stages on different accelerators cannot
+        accidentally share a timeline.
+        """
+        key = (self.n_timesteps, device.type, device.index, dtype)
+        timeline = self._timeline_cache.get(key)
+        if timeline is None:
+            linear = torch.linspace(
+                0,
+                1,
+                self.n_timesteps + 1,
+                device=device,
+                dtype=dtype,
+            )
+            timeline = (1 - torch.cos(linear * 0.5 * torch.pi)).detach()
+            self._timeline_cache[key] = timeline
+        return timeline
 
     def _encode_chunk(
         self,
@@ -299,14 +321,7 @@ class BatchedToken2Wav(nn.Module):
                 f'"available":{int(decoder.rand_noise.shape[2])}}}'
             )
         x = decoder.rand_noise[:, :, offset:end].expand(batch_size, -1, -1).clone()
-        timeline = torch.linspace(
-            0,
-            1,
-            self.n_timesteps + 1,
-            device=mu.device,
-            dtype=mu.dtype,
-        )
-        timeline = 1 - torch.cos(timeline * 0.5 * torch.pi)
+        timeline = self._cfm_timeline(mu.device, mu.dtype)
         time = timeline[0].expand(batch_size)
         mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=0)
         speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)

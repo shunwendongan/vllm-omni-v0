@@ -10,6 +10,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
+    _parse_token2wav_n_timesteps,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -138,7 +139,7 @@ class _FakeToken2Wav:
         raise AssertionError("sequential __call__ fallback must never be called")
 
 
-def _config(minimum: int = 1):
+def _config(minimum: int = 1, **extra):
     return SimpleNamespace(
         model_config=SimpleNamespace(
             model="/fake/model",
@@ -147,6 +148,7 @@ def _config(minimum: int = 1):
                     "code2wav_min_batch_size": minimum,
                     "prompt_cache_id": "shared",
                     "prompt_wav": "/fake/prompt.wav",
+                    **extra,
                 }
             },
         )
@@ -215,6 +217,82 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     assert cache0.data_ptr() != cache1.data_ptr()
     assert cache0[0, 0, 0, 0, 0].item() == 10
     assert cache1[0, 0, 0, 0, 0].item() == 20
+
+
+@pytest.mark.parametrize("steps", [10, 8, 6])
+def test_token2wav_n_timesteps_accepts_production_whitelist(steps):
+    assert _parse_token2wav_n_timesteps(steps) == steps
+    model = MiniCPMO45Code2Wav(vllm_config=_config(token2wav_n_timesteps=steps))
+    assert model._token2wav_n_timesteps == steps
+
+
+def test_token2wav_n_timesteps_defaults_to_ten():
+    model = MiniCPMO45Code2Wav(vllm_config=_config())
+    assert model._token2wav_n_timesteps == 10
+
+
+@pytest.mark.parametrize("value", [True, False, 10.0, 8.0, "10", "8", 0, 1, 2, 4, 7, 9, 11, None])
+def test_token2wav_n_timesteps_rejects_non_whitelisted_values(value):
+    with pytest.raises(ValueError, match="token2wav_n_timesteps must be an integer"):
+        MiniCPMO45Code2Wav(vllm_config=_config(token2wav_n_timesteps=value))
+
+
+@pytest.mark.parametrize("steps", [10, 8, 6])
+def test_cfm_steps_run_exact_count_reuse_timeline_and_emit_finite_tensor(steps):
+    token2wav = _FakeToken2Wav()
+    token2wav.n_timesteps = steps
+    adapter = BatchedToken2Wav(token2wav)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+
+    states = adapter.setup_batch(prompt, 1)
+    first_timeline = adapter._cfm_timeline(torch.device("cpu"), torch.float32)
+    calls_after_setup = len(token2wav.flow.decoder.estimator.cfg_batches)
+    audios, _ = adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        prompt,
+        states,
+        last_chunk=True,
+    )
+    second_timeline = adapter._cfm_timeline(torch.device("cpu"), torch.float32)
+
+    assert calls_after_setup == steps
+    assert len(token2wav.flow.decoder.estimator.cfg_batches) == 2 * steps
+    assert first_timeline is second_timeline
+    assert len(adapter._timeline_cache) == 1
+    assert first_timeline.shape == (steps + 1,)
+    assert torch.isfinite(first_timeline).all()
+    assert len(audios) == 1
+    assert audios[0].dtype == torch.float32
+    assert audios[0].numel() > 0
+    assert torch.isfinite(audios[0]).all()
+
+
+def test_cfm_timeline_cache_key_includes_steps_device_and_dtype():
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    timeline_fp32 = adapter._cfm_timeline(torch.device("cpu"), torch.float32)
+    timeline_fp64 = adapter._cfm_timeline(torch.device("cpu"), torch.float64)
+    adapter.n_timesteps = 6
+    timeline_six = adapter._cfm_timeline(torch.device("cpu"), torch.float32)
+
+    assert len(adapter._timeline_cache) == 3
+    assert timeline_fp32.dtype == torch.float32
+    assert timeline_fp64.dtype == torch.float64
+    assert timeline_six.shape == (7,)
+
+
+def test_timeline_cache_does_not_change_cfg_noise_or_curve():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav)
+    noise_before = token2wav.flow.decoder.rand_noise.clone()
+    cfg_rate_before = token2wav.flow.decoder.inference_cfg_rate
+
+    actual = adapter._cfm_timeline(torch.device("cpu"), torch.float32)
+    linear = torch.linspace(0, 1, token2wav.n_timesteps + 1, dtype=torch.float32)
+    expected = 1 - torch.cos(linear * 0.5 * torch.pi)
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(token2wav.flow.decoder.rand_noise, noise_before)
+    assert token2wav.flow.decoder.inference_cfg_rate == cfg_rate_before
 
 
 def test_fade_in_out_limits_overlap_to_available_previous_audio():

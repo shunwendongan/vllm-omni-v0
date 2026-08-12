@@ -29,6 +29,8 @@ from .batched_token2wav import (
 
 logger = init_logger(__name__)
 
+_ALLOWED_TOKEN2WAV_N_TIMESTEPS = frozenset({6, 8, 10})
+
 
 def _resolve_model_dir(model_ref: str, revision: str | None = None) -> str:
     """Resolve ``model_ref`` to a local directory containing the repo assets.
@@ -55,6 +57,19 @@ def _scalar(value: Any, default: Any = None) -> Any:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return _scalar(value[0], default) if value else default
     return default if value is None else value
+
+
+def _parse_token2wav_n_timesteps(value: Any) -> int:
+    """Validate the production MiniCPM-o CFM step count.
+
+    ``bool`` is intentionally rejected even though it is an ``int`` subclass.
+    Strings and floats are rejected instead of being silently coerced so a
+    malformed deployment fails during model construction.
+    """
+    if type(value) is not int or value not in _ALLOWED_TOKEN2WAV_N_TIMESTEPS:
+        allowed = ", ".join(str(step) for step in sorted(_ALLOWED_TOKEN2WAV_N_TIMESTEPS))
+        raise ValueError(f"MiniCPM-o token2wav_n_timesteps must be an integer in {{{allowed}}}; got {value!r}")
+    return value
 
 
 def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
@@ -150,6 +165,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             prefix="minicpmo45-runtime-prompts-",
         )
         extra = self._extra_config()
+        self._token2wav_n_timesteps = _parse_token2wav_n_timesteps(extra.get("token2wav_n_timesteps", 10))
         self._connector_config = {
             "codec_chunk_frames": int(extra.get("codec_chunk_frames", 25)),
             "codec_left_context_frames": int(extra.get("codec_left_context_frames", 3)),
@@ -771,7 +787,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             token2wav = Token2wav(
                 str(token2wav_path),
                 float16=use_float16,
-                n_timesteps=int(extra.get("token2wav_n_timesteps", 10)),
+                n_timesteps=self._token2wav_n_timesteps,
             )
         finally:
             torch.set_default_dtype(previous_dtype)
