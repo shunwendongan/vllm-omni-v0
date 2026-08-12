@@ -3,6 +3,7 @@
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
 import logging
+import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -16,6 +17,10 @@ from vllm_omni.experimental.fullduplex.engine.intermediate import (
     set_tts_handoff,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.minicpmo_4_5.optimization_config import (
+    MINICPMO45_OPTIMIZATION_CONFIG,
+    MINICPMO45_PERF_STATS,
+)
 
 logger = logging.getLogger(__name__)
 _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
@@ -931,7 +936,21 @@ def llm2tts(
         if ref_audio is not None:
             ref_waveform, ref_sr = ref_audio
             set_ref_audio(model_intermediate_buffer, _to_transport_list(ref_waveform), ref_sr)
-        handoff_hidden = _to_transport_list(tts_hidden_slice) if tts_hidden_slice is not None else None
+        handoff_started_ns = time.perf_counter_ns() if MINICPMO45_OPTIMIZATION_CONFIG.perf_stats else 0
+        if tts_hidden_slice is None:
+            handoff_hidden = None
+        elif MINICPMO45_OPTIMIZATION_CONFIG.tensor_handoff:
+            # EngineCore transport still performs D2H and writes bytes.
+            # Keeping the tensor here removes Python float object
+            # materialization; it is not a zero-copy transport.
+            handoff_hidden = tts_hidden_slice.detach()
+        else:
+            handoff_hidden = _to_transport_list(tts_hidden_slice)
+        if MINICPMO45_OPTIMIZATION_CONFIG.perf_stats and handoff_hidden is not None:
+            MINICPMO45_PERF_STATS.record_handoff(
+                tensor_path=MINICPMO45_OPTIMIZATION_CONFIG.tensor_handoff,
+                elapsed_ns=time.perf_counter_ns() - handoff_started_ns,
+            )
         native_turn_end_handoff = False
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")

@@ -354,6 +354,92 @@ def test_empty_speech_segment_finishes_without_sampling_codes() -> None:
     assert decode_embeds.shape == (1, 4)
 
 
+def test_legacy_empty_list_handoff_is_normalized_to_2d() -> None:
+    token_ids, hidden_states = MiniCPMO45OmniTTSForConditionalGeneration._normalize_tts_handoff([], [])
+
+    assert token_ids.shape == (0,)
+    assert hidden_states.shape == (0, 0)
+    assert hidden_states.dtype == torch.float32
+
+
+def test_tensor_and_legacy_handoff_normalization_is_bitwise_equal() -> None:
+    token_values = [1, 2]
+    hidden_values = [[0.0, 1.0], [2.0, 3.0]]
+
+    list_tokens, list_hidden = MiniCPMO45OmniTTSForConditionalGeneration._normalize_tts_handoff(
+        token_values,
+        hidden_values,
+    )
+    tensor_tokens, tensor_hidden = MiniCPMO45OmniTTSForConditionalGeneration._normalize_tts_handoff(
+        torch.tensor(token_values),
+        torch.tensor(hidden_values),
+    )
+
+    assert torch.equal(list_tokens, tensor_tokens)
+    assert torch.equal(list_hidden, tensor_hidden)
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "hidden_states", "message"),
+    [
+        ([[1, 2]], [[0.0, 1.0], [2.0, 3.0]], "token IDs must be 1D"),
+        ([1, 2], [0.0, 1.0], "hidden states must be 2D"),
+        ([1, 2], [[0.0, 1.0]], "condition length mismatch"),
+        ([], [[0.0, 1.0]], "condition length mismatch"),
+        ([1], [], "condition length mismatch"),
+        ([1], [[float("nan"), 0.0]], "finite values"),
+    ],
+)
+def test_invalid_handoff_contract_fails_clearly(token_ids, hidden_states, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        MiniCPMO45OmniTTSForConditionalGeneration._normalize_tts_handoff(token_ids, hidden_states)
+
+
+def test_handoff_hidden_width_is_validated_against_checkpoint() -> None:
+    with pytest.raises(ValueError, match="hidden width mismatch"):
+        MiniCPMO45OmniTTSForConditionalGeneration._normalize_tts_handoff(
+            [1],
+            [[0.0, 1.0]],
+            expected_hidden_size=4,
+        )
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "hidden_states", "message"),
+    [
+        (torch.tensor([1.5]), torch.ones(1, 2), "integer dtype"),
+        (torch.tensor([1]), torch.ones(1, 2, dtype=torch.complex64), "real numeric dtype"),
+        ([1], [[True, False]], "real numeric dtype"),
+    ],
+)
+def test_handoff_dtypes_are_validated(token_ids, hidden_states, message) -> None:
+    with pytest.raises(TypeError, match=message):
+        MiniCPMO45OmniTTSForConditionalGeneration._normalize_tts_handoff(token_ids, hidden_states)
+
+
+def test_tensor_and_legacy_handoff_build_identical_condition() -> None:
+    talker = _make_talker()
+    talker.emb_text = nn.Embedding(8, 2)
+    talker.projector_semantic = nn.Identity()
+    talker._normalize = False
+    talker._text_eos_id = 6
+    talker._tts_bos_id = 7
+    with torch.no_grad():
+        talker.emb_text.weight.copy_(torch.arange(16, dtype=torch.float32).reshape(8, 2))
+    token_values = [1, 2]
+    hidden_values = [[0.5, 1.0], [1.5, 2.0]]
+
+    list_tokens, list_hidden = talker._normalize_tts_handoff(token_values, hidden_values)
+    tensor_tokens, tensor_hidden = talker._normalize_tts_handoff(
+        torch.tensor(token_values),
+        torch.tensor(hidden_values),
+    )
+
+    list_condition = talker._build_condition_embeddings(list_tokens, list_hidden, native_duplex=False)
+    tensor_condition = talker._build_condition_embeddings(tensor_tokens, tensor_hidden, native_duplex=False)
+    assert torch.equal(list_condition, tensor_condition)
+
+
 def test_chunked_prefill_tail_aligns_condition_with_prompt_length(mocker) -> None:
     talker = _make_talker()
     talker.emb_text = nn.Embedding(1, 2)

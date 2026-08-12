@@ -3,6 +3,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.minicpmo_4_5.optimization_config import (
+    MiniCPMO45OptimizationConfig,
+)
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
     _extract_first_audio_ref,
     llm2tts,
@@ -93,7 +96,11 @@ def test_llm2tts_carries_request_ref_audio() -> None:
     assert info["ids"]["tts"] == [11, 12]
 
 
-def test_native_duplex_speak_segment_reaches_split_talker() -> None:
+def test_native_duplex_speak_segment_reaches_split_talker(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.MINICPMO45_OPTIMIZATION_CONFIG",
+        MiniCPMO45OptimizationConfig(tensor_handoff=True),
+    )
     prompt_ids = [101, 102]
     output_ids = [9304, 21, 22, 9308]
     latent = torch.arange(24, dtype=torch.float32).reshape(6, 4)
@@ -128,6 +135,9 @@ def test_native_duplex_speak_segment_reaches_split_talker() -> None:
     info = converted["model_intermediate_buffer"]
     assert info["native_duplex"] is True
     assert info["ids"]["tts"] == [21, 22]
+    assert isinstance(info["hidden_states"]["tts"], torch.Tensor)
+    assert info["hidden_states"]["tts"].dtype == torch.float32
+    assert info["hidden_states"]["tts"].is_contiguous()
     assert converted["prompt_token_ids"] == [0, 0, 0]
     assert info["meta"]["replace_streaming_prompt"] is True
     assert info["meta"]["next_stage_prompt_len"] == 3

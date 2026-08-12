@@ -244,6 +244,55 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             return torch.cat([condition, audio_bos], dim=0)
         return torch.cat([condition, self._boundary_embeddings()], dim=0)
 
+    @staticmethod
+    def _normalize_tts_handoff(
+        token_ids: object,
+        hidden_states: object,
+        *,
+        expected_hidden_size: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize the tensor and legacy-list handoffs at the stage boundary."""
+        if isinstance(token_ids, (list, tuple)):
+            token_ids = torch.empty((0,), dtype=torch.long) if len(token_ids) == 0 else torch.as_tensor(token_ids)
+        if isinstance(hidden_states, (list, tuple)):
+            hidden_states = (
+                torch.empty((0, 0), dtype=torch.float32) if len(hidden_states) == 0 else torch.as_tensor(hidden_states)
+            )
+        if not isinstance(token_ids, torch.Tensor) or not isinstance(hidden_states, torch.Tensor):
+            raise TypeError(
+                "MiniCPM-o Talker handoff must contain tensor or list values; "
+                f"received token_ids={type(token_ids).__name__}, "
+                f"hidden_states={type(hidden_states).__name__}"
+            )
+        if token_ids.ndim != 1:
+            raise ValueError(f"MiniCPM-o Talker token IDs must be 1D, got shape={tuple(token_ids.shape)}")
+        if hidden_states.ndim != 2:
+            raise ValueError(f"MiniCPM-o Talker hidden states must be 2D, got shape={tuple(hidden_states.shape)}")
+        if token_ids.dtype == torch.bool or token_ids.is_floating_point() or token_ids.is_complex():
+            raise TypeError(f"MiniCPM-o Talker token IDs must use an integer dtype, got {token_ids.dtype}")
+        if hidden_states.dtype == torch.bool or hidden_states.is_complex():
+            raise TypeError(f"MiniCPM-o Talker hidden states must use a real numeric dtype, got {hidden_states.dtype}")
+        token_count = token_ids.shape[0]
+        hidden_count = hidden_states.shape[0]
+        if hidden_count > 0 and expected_hidden_size is not None and hidden_states.shape[1] != expected_hidden_size:
+            raise ValueError(
+                "MiniCPM-o Talker hidden width mismatch: "
+                f"expected={expected_hidden_size} actual={hidden_states.shape[1]}"
+            )
+        if hidden_states.numel() > 0 and not bool(torch.isfinite(hidden_states).all().item()):
+            raise ValueError("MiniCPM-o Talker hidden states must contain only finite values")
+        both_empty = token_count == 0 and hidden_count == 0
+        aligned = token_count == hidden_count
+        single_token_broadcast = token_count == 1 and hidden_count > 0
+        if not (both_empty or aligned or single_token_broadcast):
+            raise ValueError(
+                f"MiniCPM-o Talker condition length mismatch: token_ids={token_count} hidden_states={hidden_count}"
+            )
+        return (
+            token_ids.to(dtype=torch.long).contiguous(),
+            hidden_states.to(dtype=torch.float32).contiguous(),
+        )
+
     def preprocess(
         self,
         input_ids: torch.Tensor,
@@ -259,22 +308,21 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         if is_prefill or first_call:
             token_ids, hidden_states = get_tts_handoff(info_dict)
-            # Cross-process stage transport serializes CPU tensors as lists.
-            # Normalize both local tensor handoffs and transported payloads
-            # before validating/building the Talker condition.
-            if isinstance(token_ids, (list, tuple)):
-                token_ids = torch.as_tensor(token_ids, dtype=torch.long)
-            if isinstance(hidden_states, (list, tuple)):
-                hidden_states = torch.as_tensor(hidden_states, dtype=torch.float32)
-            if not isinstance(token_ids, torch.Tensor) or not isinstance(hidden_states, torch.Tensor):
+            if token_ids is None or hidden_states is None:
                 available = sorted(key for key in info_dict if not key.startswith("_"))
                 raise ValueError(
-                    "MiniCPM-o Talker requires tensor tts_token_ids and "
-                    "tts_hidden_states conditioning; "
+                    "MiniCPM-o Talker requires tts_token_ids and tts_hidden_states conditioning; "
                     f"received token_ids={type(token_ids).__name__}, "
                     f"hidden_states={type(hidden_states).__name__}, "
                     f"available_keys={available}"
                 )
+            tts_config = getattr(self, "_tts_config", None)
+            expected_hidden_size = int(getattr(tts_config, "llm_dim", 0)) or None
+            token_ids, hidden_states = self._normalize_tts_handoff(
+                token_ids,
+                hidden_states,
+                expected_hidden_size=expected_hidden_size,
+            )
             # An empty condition means the thinker chose not to speak: finish the
             # request up front so it emits zero audio codes instead of killing
             # the stage engine.
