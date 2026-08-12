@@ -324,7 +324,7 @@ class TestResolveModelConfigPath:
         mocker: MockerFixture,
         tmp_path,
     ):
-        from vllm_omni.config.stage_config import _DEPLOY_DIR as real_deploy_dir
+        from vllm_omni.config.stage_config import _DEPLOY_DIR as _REAL_DEPLOY_DIR
         from vllm_omni.entrypoints import utils as utils_mod
 
         hf_config = SimpleNamespace(
@@ -344,7 +344,7 @@ class TestResolveModelConfigPath:
         # A bare deploy/<hf_model_type>.yaml must not win over the registered
         # pipeline default when HF model_type is not an OMNI_PIPELINES key.
         (tmp_path / "minicpmo.yaml").write_text("stages: []\n", encoding="utf-8")
-        (tmp_path / "minicpmo_4_5.yaml").write_bytes((real_deploy_dir / "minicpmo_4_5.yaml").read_bytes())
+        (tmp_path / "minicpmo_4_5.yaml").write_bytes((_REAL_DEPLOY_DIR / "minicpmo_4_5.yaml").read_bytes())
         mocker.patch.object(utils_mod, "_DEPLOY_DIR", tmp_path)
 
         result = resolve_model_config_path(model)
