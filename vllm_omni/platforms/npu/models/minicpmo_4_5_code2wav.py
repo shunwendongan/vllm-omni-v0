@@ -137,13 +137,13 @@ def _patched_estimator_step(
     )
 
 
-def _patched_setup_batch(self, features, batch_size):
+def _patched_setup_batch(self, features, batch_size, **kwargs):
     assert _original_setup_batch is not None
     with _flow_execution_context(
         features.speech_tokens.device,
         require_math=self in _backend_graph_runners,
     ):
-        return _original_setup_batch(self, features, batch_size)
+        return _original_setup_batch(self, features, batch_size, **kwargs)
 
 
 def _patched_decode_batch(
