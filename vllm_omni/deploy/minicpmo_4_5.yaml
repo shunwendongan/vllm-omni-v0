@@ -50,7 +50,7 @@ stages:
     video: 1
   max_model_len: 32768
   max_num_batched_tokens: 16384
-  max_num_seqs: 4
+  max_num_seqs: 8
   media_io_kwargs:
     video:
       fps: 1
@@ -72,7 +72,7 @@ stages:
   gpu_memory_utilization: 0.15
   max_model_len: 4096
   max_num_batched_tokens: 8192
-  max_num_seqs: 4
+  max_num_seqs: 8
   output_connectors:
     to_stage_2: connector_of_shared_memory
   stage_id: 1
@@ -97,6 +97,6 @@ stages:
     from_stage_1: connector_of_shared_memory
   max_model_len: 65536
   max_num_batched_tokens: 65536
-  max_num_seqs: 4
+  max_num_seqs: 8
   stage_id: 2
 trust_remote_code: true
