@@ -100,6 +100,7 @@ class BatchedToken2Wav(nn.Module):
         *,
         initial_state_cache_enabled: bool | None = None,
         initial_state_cache_max_entries: int | None = None,
+        batch1_low_copy: bool | None = None,
         perf_stats: bool | None = None,
     ):
         super().__init__()
@@ -154,6 +155,9 @@ class BatchedToken2Wav(nn.Module):
         )
         if self._initial_state_cache_enabled and max_entries < 1:
             raise ValueError("initial-state cache requires initial_state_cache_max_entries >= 1")
+        self._batch1_low_copy_enabled = (
+            MINICPMO45_OPTIMIZATION_CONFIG.batch1_low_copy if batch1_low_copy is None else bool(batch1_low_copy)
+        )
         self._perf_stats_enabled = MINICPMO45_OPTIMIZATION_CONFIG.perf_stats if perf_stats is None else bool(perf_stats)
         self._initial_state_templates: OrderedDict[
             InitialStateCacheKey,
@@ -351,7 +355,10 @@ class BatchedToken2Wav(nn.Module):
         return x, torch.stack(next_cnn), torch.stack(next_att)
 
     @staticmethod
-    def _split_flow_cache(cache: dict[str, torch.Tensor], batch_size: int) -> list[dict[str, torch.Tensor]]:
+    def _split_flow_cache_baseline(
+        cache: dict[str, torch.Tensor],
+        batch_size: int,
+    ) -> list[dict[str, torch.Tensor]]:
         result: list[dict[str, torch.Tensor]] = []
         for row in range(batch_size):
             result.append(
@@ -377,7 +384,7 @@ class BatchedToken2Wav(nn.Module):
         return result
 
     @staticmethod
-    def _stack_flow_cache(states: list[BatchedToken2WavState]) -> dict[str, torch.Tensor]:
+    def _stack_flow_cache_baseline(states: list[BatchedToken2WavState]) -> dict[str, torch.Tensor]:
         flows = [state.flow_cache for state in states]
         conditional_cnn = [flow["estimator_cnn_cache"][:, :, 0:1] for flow in flows]
         unconditional_cnn = [flow["estimator_cnn_cache"][:, :, 1:2] for flow in flows]
@@ -389,6 +396,35 @@ class BatchedToken2Wav(nn.Module):
             "estimator_cnn_cache": torch.cat((*conditional_cnn, *unconditional_cnn), dim=2),
             "estimator_att_cache": torch.cat((*conditional_att, *unconditional_att), dim=2),
         }
+
+    def _split_flow_cache(
+        self,
+        cache: dict[str, torch.Tensor],
+        batch_size: int,
+    ) -> list[dict[str, torch.Tensor]]:
+        if not self._batch1_low_copy_enabled or batch_size != 1:
+            return self._split_flow_cache_baseline(cache, batch_size)
+        # All tensors in ``cache`` are newly produced for this invocation. The
+        # single request owns them, so detached views remain isolated without
+        # cloning conformer caches or concatenating CFG halves.
+        return [
+            {
+                "conformer_cnn_cache": cache["conformer_cnn_cache"].detach(),
+                "conformer_att_cache": cache["conformer_att_cache"].detach(),
+                "estimator_cnn_cache": cache["estimator_cnn_cache"].detach(),
+                "estimator_att_cache": cache["estimator_att_cache"].detach(),
+            }
+        ]
+
+    def _stack_flow_cache(
+        self,
+        states: list[BatchedToken2WavState],
+    ) -> dict[str, torch.Tensor]:
+        if not self._batch1_low_copy_enabled or len(states) != 1:
+            return self._stack_flow_cache_baseline(states)
+        # State caches are request-owned and already have the exact batch-one
+        # shapes expected by the encoder and CFG estimator.
+        return states[0].flow_cache
 
     @staticmethod
     def _clone_state(state: BatchedToken2WavState) -> BatchedToken2WavState:
@@ -636,26 +672,63 @@ class BatchedToken2Wav(nn.Module):
             },
             batch_size,
         )
-        old_mel = torch.cat([state.hift_cache["mel"] for state in states], dim=0)
-        old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
-        old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
+        batch1_low_copy = self._batch1_low_copy_enabled and batch_size == 1
+        if batch1_low_copy:
+            old_mel = states[0].hift_cache["mel"]
+            old_source = states[0].hift_cache["source"]
+            old_speech = states[0].hift_cache["speech"]
+        else:
+            old_mel = torch.cat([state.hift_cache["mel"] for state in states], dim=0)
+            old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
+            old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
         mel = torch.cat((old_mel, chunk_mel), dim=2)
         speech, source = self.hift(mel, old_source)
         if old_speech.shape[-1] > 0:
             window = self.speech_window.to(device=speech.device, dtype=speech.dtype)
             speech = self._fade_in_out(speech, old_speech, window)
-        next_hift = {
-            "mel": mel[..., -self.mel_cache_len :].detach(),
-            "source": source[..., -self.source_cache_len :].detach(),
-            "speech": speech[..., -self.source_cache_len :].detach(),
-        }
+        if batch1_low_copy:
+            # A batch-one request can own the tail copies directly. The copies
+            # remain necessary to keep storage compact instead of pinning the
+            # complete generated mel/source/waveform between chunks.
+            next_hift = {
+                "mel": mel[..., -self.mel_cache_len :].detach().clone(),
+                "source": source[..., -self.source_cache_len :].detach().clone(),
+                "speech": speech[..., -self.source_cache_len :].detach().clone(),
+            }
+        else:
+            # Preserve the baseline batch path exactly: take detached tail
+            # views here and make each request-owned copy while splitting rows.
+            next_hift = {
+                "mel": mel[..., -self.mel_cache_len :].detach(),
+                "source": source[..., -self.source_cache_len :].detach(),
+                "speech": speech[..., -self.source_cache_len :].detach(),
+            }
         emitted = speech if last_chunk else speech[..., : -self.source_cache_len]
-        next_states = [
-            BatchedToken2WavState(
-                flow_cache=new_flow[row],
-                hift_cache={name: value[row : row + 1].detach().clone() for name, value in next_hift.items()},
-            )
-            for row in range(batch_size)
-        ]
+        if batch1_low_copy:
+            # The compact tail copies above are already request-owned. Reusing
+            # them here moves, but does not eliminate, the three required HiFT
+            # copies made by the baseline per-row split.
+            next_states = [
+                BatchedToken2WavState(
+                    flow_cache=new_flow[0],
+                    hift_cache={name: value.detach() for name, value in next_hift.items()},
+                )
+            ]
+            if self._perf_stats_enabled:
+                MINICPMO45_PERF_STATS.record_batch1_low_copy(
+                    flow_stack_cats=4,
+                    flow_split_cats=2,
+                    flow_clones=2,
+                    hift_stack_cats=3,
+                    hift_clones=0,
+                )
+        else:
+            next_states = [
+                BatchedToken2WavState(
+                    flow_cache=new_flow[row],
+                    hift_cache={name: value[row : row + 1].detach().clone() for name, value in next_hift.items()},
+                )
+                for row in range(batch_size)
+            ]
         audios = [emitted[row].reshape(-1).to(dtype=torch.float32) for row in range(batch_size)]
         return audios, next_states

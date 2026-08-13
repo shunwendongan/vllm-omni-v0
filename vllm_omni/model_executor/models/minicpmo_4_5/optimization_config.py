@@ -14,6 +14,7 @@ _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 TENSOR_HANDOFF_ENV = "VLLM_OMNI_MINICPMO45_TENSOR_HANDOFF"
 INITIAL_STATE_CACHE_ENV = "VLLM_OMNI_MINICPMO45_INITIAL_STATE_CACHE"
 INITIAL_STATE_CACHE_MAX_ENTRIES_ENV = "VLLM_OMNI_MINICPMO45_INITIAL_STATE_CACHE_MAX_ENTRIES"
+BATCH1_LOW_COPY_ENV = "VLLM_OMNI_MINICPMO45_BATCH1_LOW_COPY"
 PERF_STATS_ENV = "VLLM_OMNI_MINICPMO45_PERF_STATS"
 
 
@@ -55,6 +56,7 @@ class MiniCPMO45OptimizationConfig:
     tensor_handoff: bool = False
     initial_state_cache: bool = False
     initial_state_cache_max_entries: int = 1
+    batch1_low_copy: bool = False
     perf_stats: bool = False
 
     @classmethod
@@ -68,6 +70,7 @@ class MiniCPMO45OptimizationConfig:
                 INITIAL_STATE_CACHE_MAX_ENTRIES_ENV,
                 default=1,
             ),
+            batch1_low_copy=_parse_bool(values, BATCH1_LOW_COPY_ENV),
             perf_stats=_parse_bool(values, PERF_STATS_ENV),
         )
         if config.initial_state_cache and config.initial_state_cache_max_entries < 1:
@@ -91,6 +94,12 @@ class MiniCPMO45PerfStats:
     initial_state_cache_evict_count: int = 0
     initial_state_setup_ns: int = 0
     initial_state_clone_ns: int = 0
+    batch1_low_copy_count: int = 0
+    batch1_flow_stack_cat_skipped_count: int = 0
+    batch1_flow_split_cat_skipped_count: int = 0
+    batch1_flow_clone_skipped_count: int = 0
+    batch1_hift_stack_cat_skipped_count: int = 0
+    batch1_hift_clone_skipped_count: int = 0
 
     def record_handoff(self, *, tensor_path: bool, elapsed_ns: int) -> None:
         if tensor_path:
@@ -114,6 +123,22 @@ class MiniCPMO45PerfStats:
     def record_initial_state_clone(self, *, elapsed_ns: int) -> None:
         self.initial_state_clone_ns += elapsed_ns
 
+    def record_batch1_low_copy(
+        self,
+        *,
+        flow_stack_cats: int,
+        flow_split_cats: int,
+        flow_clones: int,
+        hift_stack_cats: int,
+        hift_clones: int,
+    ) -> None:
+        self.batch1_low_copy_count += 1
+        self.batch1_flow_stack_cat_skipped_count += flow_stack_cats
+        self.batch1_flow_split_cat_skipped_count += flow_split_cats
+        self.batch1_flow_clone_skipped_count += flow_clones
+        self.batch1_hift_stack_cat_skipped_count += hift_stack_cats
+        self.batch1_hift_clone_skipped_count += hift_clones
+
     def snapshot(self) -> dict[str, int]:
         return {
             "tensor_handoff_count": self.tensor_handoff_count,
@@ -124,6 +149,12 @@ class MiniCPMO45PerfStats:
             "initial_state_cache_evict_count": self.initial_state_cache_evict_count,
             "initial_state_setup_ns": self.initial_state_setup_ns,
             "initial_state_clone_ns": self.initial_state_clone_ns,
+            "batch1_low_copy_count": self.batch1_low_copy_count,
+            "batch1_flow_stack_cat_skipped_count": self.batch1_flow_stack_cat_skipped_count,
+            "batch1_flow_split_cat_skipped_count": self.batch1_flow_split_cat_skipped_count,
+            "batch1_flow_clone_skipped_count": self.batch1_flow_clone_skipped_count,
+            "batch1_hift_stack_cat_skipped_count": self.batch1_hift_stack_cat_skipped_count,
+            "batch1_hift_clone_skipped_count": self.batch1_hift_clone_skipped_count,
         }
 
     def reset(self) -> None:
@@ -135,6 +166,12 @@ class MiniCPMO45PerfStats:
         self.initial_state_cache_evict_count = 0
         self.initial_state_setup_ns = 0
         self.initial_state_clone_ns = 0
+        self.batch1_low_copy_count = 0
+        self.batch1_flow_stack_cat_skipped_count = 0
+        self.batch1_flow_split_cat_skipped_count = 0
+        self.batch1_flow_clone_skipped_count = 0
+        self.batch1_hift_stack_cat_skipped_count = 0
+        self.batch1_hift_clone_skipped_count = 0
 
 
 MINICPMO45_OPTIMIZATION_CONFIG = MiniCPMO45OptimizationConfig.from_env()
