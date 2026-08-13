@@ -2,7 +2,7 @@ async_chunk: true
 connectors:
   connector_of_shared_memory:
     extra:
-      initial_codec_chunk_frames: 5
+      initial_codec_chunk_frames: 3
       codec_chunk_frames: 25
       codec_left_context_frames: 3
       connector_get_max_wait: 300
