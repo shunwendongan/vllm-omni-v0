@@ -197,6 +197,11 @@ class BatchedToken2Wav(nn.Module):
             persistent=False,
         )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
+        # T23-2 N1: cache of setup_batch (Conformer+CFM prompt decode) results,
+        # keyed identically to _prompt_features. setup_batch is a pure function
+        # of (features, batch_size); all batch rows are identical, so caching
+        # the batch_size=1 split state covers any N. Evicted with evict_prompt.
+        self._setup_batch_cache: dict[tuple[str, str], BatchedToken2WavState] = {}
         self._hift_graph_wrapper: HiFTNPUGraphWrapper | None = None
 
     def set_hift_graph_wrapper(self, wrapper: HiFTNPUGraphWrapper | None) -> None:
@@ -227,6 +232,7 @@ class BatchedToken2Wav(nn.Module):
     def evict_prompt(self, prompt_cache_id: str, prompt_wav: str) -> None:
         """Release request-owned prompt features after stream completion."""
         self._prompt_features.pop((prompt_cache_id, prompt_wav), None)
+        self._setup_batch_cache.pop((prompt_cache_id, prompt_wav), None)
 
     @staticmethod
     def _repeat_prompt(features: PromptFeatures, batch_size: int) -> tuple[torch.Tensor, ...]:
@@ -434,7 +440,13 @@ class BatchedToken2Wav(nn.Module):
         self,
         features: PromptFeatures,
         batch_size: int,
+        prompt_cache_id: str | None = None,
+        prompt_wav: str | None = None,
     ) -> list[BatchedToken2WavState]:
+        cache_key = (prompt_cache_id, prompt_wav) if prompt_cache_id is not None else None
+        if cache_key is not None and cache_key in self._setup_batch_cache:
+            cached = self._setup_batch_cache[cache_key]
+            return [cached] * batch_size
         prompt_tokens, speakers, prompt_mels = self._repeat_prompt(features, batch_size)
         lookahead_width = self._pre_lookahead_len()
         lookahead = prompt_tokens.new_full(
@@ -464,7 +476,7 @@ class BatchedToken2Wav(nn.Module):
         }
         split = self._split_flow_cache(flow_cache, batch_size)
         mel_channels = int(prompt_mels.shape[2])
-        return [
+        states = [
             BatchedToken2WavState(
                 flow_cache=row,
                 hift_cache={
@@ -475,6 +487,20 @@ class BatchedToken2Wav(nn.Module):
             )
             for row in split
         ]
+        if cache_key is not None and cache_key not in self._setup_batch_cache:
+            # Store a defensive clone of the row-0 state: the estimator caches
+            # are only .detach()ed (shared storage); clone makes the cached
+            # copy fully independent so no decode in-place write can pollute it.
+            first = states[0]
+            cloned_flow = {
+                k: v.detach().clone() if isinstance(v, torch.Tensor) else v
+                for k, v in first.flow_cache.items()
+            }
+            self._setup_batch_cache[cache_key] = BatchedToken2WavState(
+                flow_cache=cloned_flow,
+                hift_cache=first.hift_cache,
+            )
+        return states
 
     @staticmethod
     def _fade_in_out(

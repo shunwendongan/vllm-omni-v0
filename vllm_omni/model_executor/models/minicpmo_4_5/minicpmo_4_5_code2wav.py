@@ -635,7 +635,12 @@ class MiniCPMO45Code2Wav(nn.Module):
                     bucket[0].prompt_cache_id,
                     bucket[0].prompt_wav,
                 )
-                states = self.backend.setup_batch(features, len(bucket))
+                states = self.backend.setup_batch(
+                    features,
+                    len(bucket),
+                    prompt_cache_id=bucket[0].prompt_cache_id,
+                    prompt_wav=bucket[0].prompt_wav,
+                )
             except Exception as exc:
                 self._prune_unowned_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
@@ -669,7 +674,12 @@ class MiniCPMO45Code2Wav(nn.Module):
                     bucket[0].prompt_wav,
                 )
                 if bucket[0].previous is None:
-                    states = self.backend.setup_batch(features, batch_size)
+                    states = self.backend.setup_batch(
+                        features,
+                        batch_size,
+                        prompt_cache_id=bucket[0].prompt_cache_id,
+                        prompt_wav=bucket[0].prompt_wav,
+                    )
                 else:
                     states = [item.previous.token2wav for item in bucket if item.previous is not None]
                 tokens = torch.stack([item.tokens for item in bucket], dim=0)
