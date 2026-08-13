@@ -102,10 +102,11 @@ class _FakeHiFT(nn.Module):
     def __init__(self):
         super().__init__()
         self.calls: list[int] = []
+        self.sources: list[torch.Tensor] = []
 
     def forward(self, mel, source):
-        del source
         self.calls.append(mel.shape[0])
+        self.sources.append(source)
         speech = mel[:, 0].repeat_interleave(3, dim=1)
         generated_source = speech[:, None]
         return speech, generated_source
@@ -159,6 +160,7 @@ def _model(
     *,
     initial_state_cache: bool = False,
     initial_state_cache_max_entries: int = 1,
+    batch1_low_copy: bool = False,
     perf_stats: bool = False,
 ):
     token2wav = _FakeToken2Wav()
@@ -166,11 +168,13 @@ def _model(
         token2wav,
         initial_state_cache_enabled=initial_state_cache,
         initial_state_cache_max_entries=initial_state_cache_max_entries,
+        batch1_low_copy=batch1_low_copy,
         perf_stats=perf_stats,
     )
     optimization_config = MiniCPMO45OptimizationConfig(
         initial_state_cache=initial_state_cache,
         initial_state_cache_max_entries=initial_state_cache_max_entries,
+        batch1_low_copy=batch1_low_copy,
         perf_stats=perf_stats,
     )
     model = MiniCPMO45Code2Wav(vllm_config=_config())
@@ -208,6 +212,10 @@ def _assert_states_equal(actual, expected) -> None:
         torch.testing.assert_close(actual.flow_cache[name], expected.flow_cache[name])
     for name in actual.hift_cache:
         torch.testing.assert_close(actual.hift_cache[name], expected.hift_cache[name])
+
+
+def _clone_states(states):
+    return [BatchedToken2Wav._clone_state(state) for state in states]
 
 
 def test_code2wav_resolves_hf_model_id_for_assets(mocker, tmp_path):
@@ -332,6 +340,258 @@ def test_estimator_cache_stack_split_round_trip_preserves_cfg_rows():
             round_tripped["estimator_att_cache"],
             original.flow_cache["estimator_att_cache"],
         )
+
+
+def test_batch1_low_copy_matches_baseline_caches_and_waveforms():
+    token2wav = _FakeToken2Wav()
+    baseline = BatchedToken2Wav(token2wav, batch1_low_copy=False)
+    candidate = BatchedToken2Wav(token2wav, batch1_low_copy=True)
+    features = baseline.prepare_prompt("shared", "/fake/prompt.wav")
+    baseline_states = baseline.setup_batch(features, 1)
+    candidate_states = _clone_states(baseline_states)
+
+    for tokens, last_chunk in [([10, 11], False), ([12, 13], True)]:
+        baseline_audio, baseline_states = baseline.decode_batch(
+            torch.tensor([tokens]),
+            features,
+            baseline_states,
+            last_chunk=last_chunk,
+        )
+        candidate_audio, candidate_states = candidate.decode_batch(
+            torch.tensor([tokens]),
+            features,
+            candidate_states,
+            last_chunk=last_chunk,
+        )
+
+        torch.testing.assert_close(candidate_audio[0], baseline_audio[0], rtol=0, atol=0)
+        _assert_states_equal(candidate_states[0], baseline_states[0])
+
+
+def test_batch1_low_copy_skips_singleton_flow_materialization():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, batch1_low_copy=True)
+    features = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(features, 1)
+    original = states[0]
+
+    stacked = adapter._stack_flow_cache(states)
+    assert stacked is original.flow_cache
+    split = adapter._split_flow_cache(stacked, 1)
+    for name, value in original.flow_cache.items():
+        assert split[0][name].data_ptr() == value.data_ptr()
+        assert split[0][name].untyped_storage().data_ptr() == value.untyped_storage().data_ptr()
+
+
+@pytest.mark.parametrize("batch_size", [2, 4])
+def test_batch1_low_copy_keeps_batch_greater_than_one_on_baseline_path(
+    batch_size,
+    monkeypatch,
+):
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, batch1_low_copy=True)
+    features = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(features, batch_size)
+    baseline_stack = adapter._stack_flow_cache_baseline
+    baseline_split = adapter._split_flow_cache_baseline
+    stack_calls = 0
+    split_calls = 0
+
+    def tracked_stack(values):
+        nonlocal stack_calls
+        stack_calls += 1
+        return baseline_stack(values)
+
+    def tracked_split(cache, size):
+        nonlocal split_calls
+        split_calls += 1
+        return baseline_split(cache, size)
+
+    monkeypatch.setattr(adapter, "_stack_flow_cache_baseline", tracked_stack)
+    monkeypatch.setattr(adapter, "_split_flow_cache_baseline", tracked_split)
+    tokens = torch.arange(batch_size * 2).reshape(batch_size, 2) + 10
+
+    adapter.decode_batch(tokens, features, states, last_chunk=False)
+
+    assert stack_calls == 1
+    # The tracker is installed after setup, so this is decode's split only.
+    assert split_calls == 1
+
+
+@pytest.mark.parametrize("batch_size", [2, 4])
+def test_batch1_low_copy_matches_baseline_for_true_batches(batch_size):
+    token2wav = _FakeToken2Wav()
+    baseline = BatchedToken2Wav(token2wav, batch1_low_copy=False)
+    candidate = BatchedToken2Wav(token2wav, batch1_low_copy=True)
+    features = baseline.prepare_prompt("shared", "/fake/prompt.wav")
+    baseline_states = baseline.setup_batch(features, batch_size)
+    candidate_states = _clone_states(baseline_states)
+
+    chunks = [
+        (torch.arange(batch_size * 2).reshape(batch_size, 2) + 10, False),
+        (torch.arange(batch_size * 2).reshape(batch_size, 2) + 20, True),
+    ]
+    for tokens, last_chunk in chunks:
+        baseline_audio, baseline_states = baseline.decode_batch(
+            tokens,
+            features,
+            baseline_states,
+            last_chunk=last_chunk,
+        )
+        candidate_audio, candidate_states = candidate.decode_batch(
+            tokens,
+            features,
+            candidate_states,
+            last_chunk=last_chunk,
+        )
+
+        for candidate_row, baseline_row in zip(candidate_audio, baseline_audio, strict=True):
+            torch.testing.assert_close(candidate_row, baseline_row, rtol=0, atol=0)
+        for candidate_state, baseline_state in zip(candidate_states, baseline_states, strict=True):
+            _assert_states_equal(candidate_state, baseline_state)
+
+
+def test_batch1_low_copy_disabled_keeps_singleton_on_baseline_path(monkeypatch):
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, batch1_low_copy=False)
+    features = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(features, 1)
+    baseline_stack = adapter._stack_flow_cache_baseline
+    baseline_split = adapter._split_flow_cache_baseline
+    stack_calls = 0
+    split_calls = 0
+
+    def tracked_stack(values):
+        nonlocal stack_calls
+        stack_calls += 1
+        return baseline_stack(values)
+
+    def tracked_split(cache, size):
+        nonlocal split_calls
+        split_calls += 1
+        return baseline_split(cache, size)
+
+    monkeypatch.setattr(adapter, "_stack_flow_cache_baseline", tracked_stack)
+    monkeypatch.setattr(adapter, "_split_flow_cache_baseline", tracked_split)
+
+    adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        features,
+        states,
+        last_chunk=False,
+    )
+
+    assert stack_calls == 1
+    assert split_calls == 1
+
+
+def test_batch1_low_copy_does_not_mutate_input_state():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, batch1_low_copy=True)
+    features = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(features, 1)
+    before = _clone_states(states)
+
+    adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        features,
+        states,
+        last_chunk=False,
+    )
+
+    _assert_states_equal(states[0], before[0])
+
+
+def test_batch1_low_copy_next_state_does_not_alias_input_storage():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, batch1_low_copy=True)
+    features = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(features, 1)
+
+    _, next_states = adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        features,
+        states,
+        last_chunk=False,
+    )
+
+    for old_cache, new_cache in (
+        (states[0].flow_cache, next_states[0].flow_cache),
+        (states[0].hift_cache, next_states[0].hift_cache),
+    ):
+        for name, old_value in old_cache.items():
+            new_value = new_cache[name]
+            if old_value.untyped_storage().nbytes() and new_value.untyped_storage().nbytes():
+                assert old_value.untyped_storage().data_ptr() != new_value.untyped_storage().data_ptr()
+
+
+def test_batch1_low_copy_hift_tails_use_compact_request_storage():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, batch1_low_copy=True)
+    features = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(features, 1)
+
+    _, next_states = adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        features,
+        states,
+        last_chunk=False,
+    )
+
+    for value in next_states[0].hift_cache.values():
+        assert value.untyped_storage().nbytes() == value.numel() * value.element_size()
+
+
+def test_batch1_low_copy_passes_request_owned_hift_source_directly():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, batch1_low_copy=True)
+    features = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(features, 1)
+    _, states = adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        features,
+        states,
+        last_chunk=False,
+    )
+    old_source = states[0].hift_cache["source"]
+
+    adapter.decode_batch(
+        torch.tensor([[12, 13]]),
+        features,
+        states,
+        last_chunk=True,
+    )
+
+    assert token2wav.hift.sources[-1] is old_source
+
+
+def test_batch1_low_copy_perf_stats_count_skipped_materializations():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(
+        token2wav,
+        batch1_low_copy=True,
+        perf_stats=True,
+    )
+    features = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(features, 1)
+    MINICPMO45_PERF_STATS.reset()
+
+    adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        features,
+        states,
+        last_chunk=False,
+    )
+
+    stats = MINICPMO45_PERF_STATS.snapshot()
+    assert stats["batch1_low_copy_count"] == 1
+    assert stats["batch1_flow_stack_cat_skipped_count"] == 4
+    assert stats["batch1_flow_split_cat_skipped_count"] == 2
+    assert stats["batch1_flow_clone_skipped_count"] == 2
+    assert stats["batch1_hift_stack_cat_skipped_count"] == 3
+    # HiFT still needs three compact request-owned tail copies. The fast path
+    # only moves where those copies occur, so it must not claim they vanished.
+    assert stats["batch1_hift_clone_skipped_count"] == 0
 
 
 def test_initial_state_cache_cold_miss_and_warm_hit_are_request_owned(tmp_path):

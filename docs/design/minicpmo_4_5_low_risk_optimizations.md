@@ -32,8 +32,25 @@ unchanged setup path. A warm hit deep-clones every Flow and HiFT tensor for
 each request, so the stored template is never passed to decode. Runtime-uploaded
 or otherwise custom reference audio always runs the uncached setup path.
 
+## Batch-one low-copy Code2Wav
+
+Set `VLLM_OMNI_MINICPMO45_BATCH1_LOW_COPY=1` to enable the request-owned
+batch-one fast path. It directly supplies the existing Flow caches instead of
+concatenating singleton lists, retains newly generated detached Flow cache
+storage instead of splitting it with singleton cat/clone operations, and
+directly references singleton HiFT history. Newly generated compact HiFT tail
+copies remain owned by that request; this moves the three required copies to
+tail materialization and does not claim that those copies were eliminated. The
+HiFT source history is read to seed newly generated source storage; it is not
+modified in place by the pinned backend.
+
+Batch sizes greater than one continue to use the original stack/split and HiFT
+materialization implementation. Disabling the switch also keeps batch one on
+that original path.
+
 Set `VLLM_OMNI_MINICPMO45_PERF_STATS=1` to collect process-local host timing
 and path counters, including initial-state hit/miss/eviction and setup/clone
-host time. These counters do not synchronize the accelerator.
+host time plus batch-one fast-path and skipped cat/clone counts. These counters
+do not synchronize the accelerator.
 
 No Ascend A3 performance or full accuracy result is claimed by this change.
