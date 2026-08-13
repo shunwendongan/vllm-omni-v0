@@ -235,13 +235,19 @@ def _npu_top_k_top_p_warp(
 def _make_sample_tail_compute(*, penalty: float, eos_id: int, top_k: int, top_p: int):
     """Eager reference for the captured codec sampling tail (closure-captured
     constants; NPUExactGraphRunner calls compute(*inputs) only)."""
+    # T17-4 C2 fix: the penalty device scalar is created lazily on the first
+    # call (outside NPU capture, during the eager prime run) and reused for
+    # capture+replay. Creating it inside the captured compute did a host->device
+    # memcpy that NPU capture mode rejects (aclrtMemcpy 107030, "current capture
+    # mode does not support this operation"), failing the codec_tail capture.
+    _penalty_dev = None
 
     def compute(logits, freq, noise, mask_eos):
+        nonlocal _penalty_dev
         if penalty != 1.0:
-            alpha = torch.pow(
-                torch.as_tensor(penalty, device=logits.device, dtype=logits.dtype),
-                freq,
-            )
+            if _penalty_dev is None or _penalty_dev.device != logits.device or _penalty_dev.dtype != logits.dtype:
+                _penalty_dev = torch.as_tensor(penalty, device=logits.device, dtype=logits.dtype)
+            alpha = torch.pow(_penalty_dev, freq)
             logits = torch.where(logits < 0, logits * alpha, logits / alpha)
         logits[:, eos_id].masked_fill_(mask_eos, float("-inf"))
         if _NPU_TOP_K_TOP_P:
