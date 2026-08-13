@@ -446,7 +446,13 @@ class BatchedToken2Wav(nn.Module):
         cache_key = (prompt_cache_id, prompt_wav) if prompt_cache_id is not None else None
         if cache_key is not None and cache_key in self._setup_batch_cache:
             cached = self._setup_batch_cache[cache_key]
+            import logging
+            logging.getLogger(__name__).info(
+                '[T23-N1] setup_batch CACHE HIT key=%s bs=%d', cache_key, batch_size)
             return [cached] * batch_size
+        import logging
+        logging.getLogger(__name__).info(
+            '[T23-N1] setup_batch MISS key=%s bs=%d', cache_key, batch_size)
         prompt_tokens, speakers, prompt_mels = self._repeat_prompt(features, batch_size)
         lookahead_width = self._pre_lookahead_len()
         lookahead = prompt_tokens.new_full(
