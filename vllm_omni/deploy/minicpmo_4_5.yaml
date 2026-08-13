@@ -16,6 +16,8 @@ connectors:
       codec_left_context_frames: 3
       # Production default; supported experiment values are 10, 8, and 6.
       token2wav_n_timesteps: 10
+      # NPU-only Flow autocast experiment. HiFT and waveform stay FP32.
+      token2wav_float16: false
       # HiFT capture buckets are derived from codec_chunk_frames and
       # codec_left_context_frames. (#5869)
       # A future initial_codec_chunk_frames shape will use lazy capture unless

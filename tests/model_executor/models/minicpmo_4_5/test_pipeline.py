@@ -164,6 +164,7 @@ class TestDeployTopology:
         assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(expected_processor)
         if filename == "minicpmo_4_5.yaml":
             assert connector["extra"]["token2wav_n_timesteps"] == 10
+            assert connector["extra"]["token2wav_float16"] is False
             assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [4, 4, 4]
             memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
             assert memory_utilizations == [

@@ -30,6 +30,8 @@ from .batched_token2wav import (
 logger = init_logger(__name__)
 
 _ALLOWED_TOKEN2WAV_N_TIMESTEPS = frozenset({6, 8, 10})
+_TRUE_CONFIG_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_CONFIG_VALUES = frozenset({"0", "false", "no", "off"})
 
 
 def _resolve_model_dir(model_ref: str, revision: str | None = None) -> str:
@@ -70,6 +72,23 @@ def _parse_token2wav_n_timesteps(value: Any) -> int:
         allowed = ", ".join(str(step) for step in sorted(_ALLOWED_TOKEN2WAV_N_TIMESTEPS))
         raise ValueError(f"MiniCPM-o token2wav_n_timesteps must be an integer in {{{allowed}}}; got {value!r}")
     return value
+
+
+def _parse_token2wav_float16(value: Any) -> bool:
+    """Parse the deployment toggle without Python truthiness surprises."""
+    if isinstance(value, bool):
+        return value
+    if type(value) is int and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUE_CONFIG_VALUES:
+            return True
+        if normalized in _FALSE_CONFIG_VALUES:
+            return False
+    raise ValueError(
+        f"MiniCPM-o token2wav_float16 must be a boolean, 0/1, or one of true/false, yes/no, on/off; got {value!r}"
+    )
 
 
 def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
@@ -166,6 +185,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         )
         extra = self._extra_config()
         self._token2wav_n_timesteps = _parse_token2wav_n_timesteps(extra.get("token2wav_n_timesteps", 10))
+        self._token2wav_float16 = _parse_token2wav_float16(extra.get("token2wav_float16", False))
         self._connector_config = {
             "codec_chunk_frames": int(extra.get("codec_chunk_frames", 25)),
             "codec_left_context_frames": int(extra.get("codec_left_context_frames", 3)),
@@ -777,7 +797,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         token2wav_path = Path(self.model_path) / "assets" / "token2wav"
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
-        use_float16 = bool(extra.get("token2wav_float16", False))
+        use_float16 = self._token2wav_float16
+        use_npu_flow_autocast = use_float16 and current_omni_platform.is_npu()
+        # NPU Flow weights stay FP32 so an unavailable autocast API can fall
+        # back safely. CUDA retains the existing half-weight behavior.
+        use_half_weights = use_float16 and not use_npu_flow_autocast
         previous_dtype = torch.get_default_dtype()
         try:
             # vLLM constructs bf16 models under a bf16 default-dtype context.
@@ -786,7 +810,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             torch.set_default_dtype(torch.float32)
             token2wav = Token2wav(
                 str(token2wav_path),
-                float16=use_float16,
+                float16=use_half_weights,
                 n_timesteps=self._token2wav_n_timesteps,
             )
         finally:
@@ -818,4 +842,5 @@ class MiniCPMO45Code2Wav(nn.Module):
             trt_stepper=trt_stepper,
             connector_config=self._connector_config,
             hift_graph_config=self._hift_graph_config,
+            npu_flow_float16=use_npu_flow_autocast,
         )
