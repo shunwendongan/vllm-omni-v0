@@ -623,7 +623,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # A3 (T12-5): capture the tail (penalty+eos+warp+add+argmax) into an
         # exact-shape NPU graph; per-step host dispatch -> single replay.
         if (
-            os.environ.get("T12_SAMPLE_GRAPH", "1") == "1"
+            os.environ.get("T12_SAMPLE_GRAPH", "0") == "1"
             and not self._sample_graph_disabled
             and batch_size > 0
         ):
