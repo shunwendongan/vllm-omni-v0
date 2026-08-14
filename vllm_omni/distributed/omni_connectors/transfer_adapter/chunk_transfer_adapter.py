@@ -304,17 +304,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def _send_single_request(self, task: dict):
         raw_mm = task["multimodal_output"]
         multimodal_output = unflatten_payload(raw_mm) if isinstance(raw_mm, Mapping) else raw_mm
-        # Wave3-5 C-2: the MiniCPM-o Stage1 processor consumes only ``meta``
-        # plus ``hidden_states`` from this payload (see
-        # stage_input_processors/minicpmo_4_5_omni.py). The remaining keys
-        # (model_outputs / trajectory_latents / latents — the ~2.7MB latent)
-        # are re-sent here even though Stage1 already receives them via the
-        # orchestrator handoff path. Trim to the consumed subset so the
-        # connector serialization does not duplicate the large tensors.
-        if isinstance(multimodal_output, Mapping):
-            trimmed = {k: v for k, v in multimodal_output.items() if k in ("meta", "hidden_states")}
-            if trimmed:
-                multimodal_output = trimmed
         request = task["request"]
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
