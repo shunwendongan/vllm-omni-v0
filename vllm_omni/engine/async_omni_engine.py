@@ -44,13 +44,20 @@ def _w4_full_chain_prewarm(port: int) -> None:
                 "modalities": ["text", "audio"],
             },
         }
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/v1/chat/completions",
-            data=_json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            resp.read()
+        for attempt in range(120):
+            try:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    data=_json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    resp.read()
+                break
+            except Exception:
+                if attempt == 119:
+                    raise
+                __import__("time").sleep(5)
         logger.info("[W4-I03] full-chain prewarm done")
     except Exception as exc:  # noqa: BLE001
         logger.warning("[W4-I03] full-chain prewarm failed (non-fatal): %s", exc)
