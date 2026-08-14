@@ -472,6 +472,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
+        self._omni_async_step_budget = int(os.environ.get("VLLM_OMNI_NPU_ASYNC_OUTPUT_STEPS", "40"))
+        self._omni_async_steps: dict[str, int] = {}
+
         _OMNI_CONNECTOR_INIT_ARCHS = {
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
@@ -1436,6 +1439,23 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             query_start_loc_cpu = query_start_loc_cpu()
 
         _use_async_omni = self._should_use_async_omni_output()
+        if _use_async_omni and self._omni_async_step_budget > 0:
+            # Wave4 front-loaded: per-request step budget. Each request's
+            # first N steps run async (TTFT/TTFP window); once the budget is
+            # exhausted the request falls back to sync (RTF regression gone).
+            _budgeted = False
+            for _rid in req_ids_output_copy:
+                _n = self._omni_async_steps.get(_rid, 0)
+                if _n < self._omni_async_step_budget:
+                    _budgeted = True
+                self._omni_async_steps[_rid] = _n + 1
+            if not _budgeted:
+                _use_async_omni = False
+        # free step counters for finished requests (bounded memory)
+        if len(self._omni_async_steps) > 256:
+            _live = set(req_ids_output_copy)
+            self._omni_async_steps = {k: v for k, v in self._omni_async_steps.items() if k in _live}
+
         if _use_async_omni:
             _copy_stream = self._get_or_create_omni_payload_copy_stream()
             _hs_snap = _snapshot_npu_tensor_payload_to_cpu_async(
