@@ -799,6 +799,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             torch.set_default_dtype(previous_dtype)
         self.backend = BatchedToken2Wav(token2wav)
         self._maybe_warmup_hift()
+        self._maybe_preseed_setup_batch()
 
     def _maybe_warmup_hift(self) -> None:
         """Run one representative HiFT inference before serving requests.
@@ -837,3 +838,30 @@ class MiniCPMO45Code2Wav(nn.Module):
                 exc_info=True,
             )
         del mel, cache_source
+
+    def _maybe_preseed_setup_batch(self) -> None:
+        """Pre-warm the setup_batch (Conformer+CFM prompt decode) cache for the
+        default ref audio at startup, so first-user-request TTFP is not hit by
+        the one-time 30-70ms prompt conditioning. Gated by the same
+        ``enable_hift_warmup`` flag; failure is non-fatal."""
+        extra = self._extra_config()
+        if not extra.get("enable_hift_warmup", False):
+            return
+        backend = getattr(self, "backend", None)
+        if backend is None:
+            return
+        try:
+            features = backend.prepare_prompt(self._default_prompt_id, self._default_prompt_wav)
+            backend.setup_batch(
+                features,
+                1,
+                prompt_cache_id=self._default_prompt_id,
+                prompt_wav=self._default_prompt_wav,
+            )
+            torch.accelerator.synchronize()
+            logger.info(
+                "[T23-N1P] preseeded setup_batch cache for %s (HT_ref_audio)",
+                self._default_prompt_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[T23-N1P] preseed failed (non-fatal): %s", exc)
