@@ -113,3 +113,27 @@ commits.*
   `--allowed-local-media-path /workspace/vllm-omni-data` (both in `serve.sh`).
 - The full Video-MME set (2700) and Daily-Omni set (1197) each take tens of
   minutes at the given concurrency; budget GPU time accordingly.
+
+
+## 6. Final-stack official matrix (2026-08-14, T28)
+
+Final optimization stack (branch `t23-2-n1`): CC-1 (max_num_seqs 4→8) + N1
+(setup_batch flow cache) + N1P (default-ref preseed) + N3 (Stage2 chain
+compile prewarm) + X1 (penalty device cache); sampling-tail graph disabled
+(T12_SAMPLE_GRAPH=0); #6184 async-output code kept, default OFF (RTF +0.02
+regression vs TTFT/TTFP benefit — coordinator decision).
+
+Official-metric 3-group matrix (fresh serve, `vllm bench serve` same params as
+official pytest: 32/64/128 prompts × concurrency 1/4/8, mean):
+
+| Group | RTF | TTFT (ms) | TTFP (ms) | E2EL (ms) | vs official baseline |
+|---|---|---|---|---|---|
+| c=1 (32) | **0.3047** | **257.8** | **364.0** | 1266.6 | 0.4423 → -31% |
+| c=4 (64) | **0.4427** | **370.9** | **561.6** | 1926.9 | 1.5734 → -72% |
+| c=8 (128) | **0.6298** | **432.1** | **826.0** | 2784.3 | 2.3024 → -73% |
+
+vs previous stack (T17 eager): c1 TTFT 297→258 (-13%), TTFP 430→364 (-15%);
+c4 TTFP 715→562 (-21%); c8 TTFP 1699→826 (-51%). c1 RTF 0.27→0.30 reflects
+the RTF vs TTFT/TTFP trade of keeping #6184 off (coordinator-approved).
+
+Evidence JSON: `submission/benchmark_results/t28_final_matrix_c{1,4,8}_*.json`.
