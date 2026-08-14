@@ -800,6 +800,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         self.backend = BatchedToken2Wav(token2wav)
         self._maybe_warmup_hift()
         self._maybe_preseed_setup_batch()
+        self._maybe_prewarm_chain()
 
     def _maybe_warmup_hift(self) -> None:
         """Run one representative HiFT inference before serving requests.
@@ -865,3 +866,31 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("[T23-N1P] preseed failed (non-fatal): %s", exc)
+
+    def _maybe_prewarm_chain(self) -> None:
+        """Absorb the one-time S3/Conformer/CFM kernel compiles at startup.
+        Runs a representative codec chunk through the Stage2 chain
+        (prepare_prompt + setup_batch + one decode_batch step) so the first
+        real request does not pay compile latency in its mean. Gated by the
+        same ``enable_hift_warmup`` flag; failure is non-fatal."""
+        extra = self._extra_config()
+        if not extra.get("enable_hift_warmup", False):
+            return
+        backend = getattr(self, "backend", None)
+        if backend is None:
+            return
+        try:
+            features = backend.prepare_prompt(self._default_prompt_id, self._default_prompt_wav)
+            states = backend.setup_batch(
+                features,
+                1,
+                prompt_cache_id=self._default_prompt_id,
+                prompt_wav=self._default_prompt_wav,
+            )
+            # one decode step with a representative short token run
+            tokens = torch.tensor([[1, 2, 3, 4]], device=features.speech_tokens.device, dtype=torch.long)
+            backend.decode_batch(tokens, features, states, last_chunk=False)
+            torch.accelerator.synchronize()
+            logger.info("[T23-N3] Stage2 chain prewarm done")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[T23-N3] chain prewarm failed (non-fatal): %s", exc)
