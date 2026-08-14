@@ -1695,6 +1695,8 @@ async def _w4_full_chain_prewarm(app_state) -> None:
     import urllib.request
 
     logger = logging.getLogger("vllm_omni.w4_prewarm")
+    logger.info("[W4-I03] full-chain prewarm task started")
+
     try:
         port = getattr(app_state, "server_port", None)
         if not port:
@@ -1742,9 +1744,16 @@ async def health(raw_request: Request) -> JSONResponse:
 
     try:
         await engine_client.check_health()
-        if os.environ.get("W4_PREWARM", "0") == "1" and not _prewarm_health_state["done"]:
+        _w4_env = os.environ.get("W4_PREWARM", "0")
+        print(f"[W4-I03] health handler: env={_w4_env} done={_prewarm_health_state['done']}", flush=True)
+        if _w4_env == "1" and not _prewarm_health_state["done"]:
             _prewarm_health_state["done"] = True
-            asyncio.get_event_loop().create_task(_w4_full_chain_prewarm(raw_request.app.state))
+            _w4_task = asyncio.create_task(_w4_full_chain_prewarm(raw_request.app.state))
+            _w4_task.add_done_callback(lambda t: print(
+                f"[W4-I03] prewarm task done ok={t.cancelled() or t.exception() is None} exc={t.exception()}",
+                flush=True)
+            )
+
         return JSONResponse(content={"status": "healthy"})
     except EngineDeadError:
         return JSONResponse(

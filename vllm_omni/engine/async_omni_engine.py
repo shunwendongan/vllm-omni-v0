@@ -8,6 +8,7 @@ with the Orchestrator (running in a background thread) via janus queues.
 from __future__ import annotations
 
 import asyncio
+import os
 import concurrent.futures
 import dataclasses
 import json
@@ -18,6 +19,44 @@ import uuid
 import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
+
+def _w4_full_chain_prewarm(port: int) -> None:
+    """One-shot full-chain prewarm: send a synthetic TTS request through all
+    stages to absorb Stage0/1 graph captures + Stage2 chain compiles.
+    Gated by W4_PREWARM=1; failure warning-only; runs in a background thread."""
+    import base64
+    import json as _json
+    import logging
+    import urllib.request
+
+    logger = logging.getLogger("vllm_omni.w4_prewarm")
+    try:
+        body = {
+            "model": "openbmb/MiniCPM-o-4_5",
+            "messages": [
+                {"role": "system", "content": "你是 MiniCPM-o。请简短回答。"},
+                {"role": "user", "content": [{"type": "text", "text": "你好"}]},
+            ],
+            "max_tokens": 64,
+            "temperature": 0.0,
+            "extra_body": {
+                "chat_template_kwargs": {"use_tts_template": True},
+                "modalities": ["text", "audio"],
+            },
+        }
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            data=_json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            resp.read()
+        logger.info("[W4-I03] full-chain prewarm done")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[W4-I03] full-chain prewarm failed (non-fatal): %s", exc)
+
+
+
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import janus
@@ -295,6 +334,11 @@ class AsyncOmniEngine:
         )
 
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
+        if os.environ.get("W4_PREWARM", "0") == "1" and not getattr(self, "_w4_prewarm_fired", False):
+            self._w4_prewarm_fired = True
+            port = int(os.environ.get("W4_PREWARM_PORT", "8094"))
+            threading.Thread(target=_w4_full_chain_prewarm, args=(port,), daemon=True).start()
+
 
     def get_diffusion_od_config(self) -> Any:
         """Expose the diffusion ``model_class_name`` to client-side model-extras.
