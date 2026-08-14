@@ -10,6 +10,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
+    _parse_enable_token2wav_npu_cfm_graph,
+    _parse_positive_graph_budget,
     _parse_token2wav_float16,
     _parse_token2wav_n_timesteps,
 )
@@ -218,6 +220,10 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     assert cache0.data_ptr() != cache1.data_ptr()
     assert cache0[0, 0, 0, 0, 0].item() == 10
     assert cache1[0, 0, 0, 0, 0].item() == 20
+    graph_telemetry = adapter.npu_cfm_graph_telemetry()
+    assert graph_telemetry["calls"] == 2
+    assert graph_telemetry["cache_entries"] == 0
+    assert graph_telemetry["fallback_reasons"]["disabled"] == 2
 
 
 @pytest.mark.parametrize("steps", [10, 8, 6])
@@ -260,6 +266,54 @@ def test_token2wav_float16_accepts_compatible_boolean_values(value, expected):
 def test_token2wav_float16_defaults_to_false():
     model = MiniCPMO45Code2Wav(vllm_config=_config())
     assert model._token2wav_float16 is False
+
+
+@pytest.mark.parametrize("value", [True, 1, "true", " YES ", "on"])
+def test_npu_cfm_graph_toggle_accepts_compatible_true_values(value):
+    assert _parse_enable_token2wav_npu_cfm_graph(value) is True
+    model = MiniCPMO45Code2Wav(vllm_config=_config(enable_token2wav_npu_cfm_graph=value))
+    assert model._npu_cfm_graph_config["enabled"] is True
+
+
+@pytest.mark.parametrize("value", [False, 0, "false", " NO ", "off"])
+def test_npu_cfm_graph_toggle_accepts_compatible_false_values(value):
+    assert _parse_enable_token2wav_npu_cfm_graph(value) is False
+    model = MiniCPMO45Code2Wav(vllm_config=_config(enable_token2wav_npu_cfm_graph=value))
+    assert model._npu_cfm_graph_config["enabled"] is False
+
+
+def test_npu_cfm_graph_defaults_are_disabled_and_bounded():
+    model = MiniCPMO45Code2Wav(vllm_config=_config())
+    assert model._npu_cfm_graph_config == {
+        "enabled": False,
+        "max_entries": 4,
+        "max_bytes": 536870912,
+    }
+
+
+@pytest.mark.parametrize("value", [2, -1, 0.0, 1.0, None, "", "enabled", [], {}])
+def test_npu_cfm_graph_toggle_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="enable_token2wav_npu_cfm_graph must be"):
+        MiniCPMO45Code2Wav(vllm_config=_config(enable_token2wav_npu_cfm_graph=value))
+
+
+@pytest.mark.parametrize("name", ["token2wav_npu_cfm_graph_max_entries", "token2wav_npu_cfm_graph_max_bytes"])
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.0, "4", None, [], {}])
+def test_npu_cfm_graph_budgets_reject_non_positive_non_integer_values(name, value):
+    with pytest.raises(ValueError, match=name):
+        MiniCPMO45Code2Wav(vllm_config=_config(**{name: value}))
+
+
+def test_npu_cfm_graph_budgets_accept_positive_integers():
+    assert _parse_positive_graph_budget(3, name="entries") == 3
+    model = MiniCPMO45Code2Wav(
+        vllm_config=_config(
+            token2wav_npu_cfm_graph_max_entries=3,
+            token2wav_npu_cfm_graph_max_bytes=1024,
+        )
+    )
+    assert model._npu_cfm_graph_config["max_entries"] == 3
+    assert model._npu_cfm_graph_config["max_bytes"] == 1024
 
 
 @pytest.mark.parametrize("value", [2, -1, 0.0, 1.0, None, "", "enabled", [], {}])

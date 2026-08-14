@@ -91,6 +91,23 @@ def _parse_token2wav_float16(value: Any) -> bool:
     )
 
 
+def _parse_enable_token2wav_npu_cfm_graph(value: Any) -> bool:
+    """Parse the NPU CFM Graph feature flag with explicit failures."""
+    try:
+        return _parse_token2wav_float16(value)
+    except ValueError:
+        raise ValueError(
+            "MiniCPM-o enable_token2wav_npu_cfm_graph must be a boolean, 0/1, "
+            f"or one of true/false, yes/no, on/off; got {value!r}"
+        ) from None
+
+
+def _parse_positive_graph_budget(value: Any, *, name: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"MiniCPM-o {name} must be a positive integer; got {value!r}")
+    return value
+
+
 def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
     if isinstance(value, torch.Tensor):
         return value.reshape(-1).to(device=fallback.device, dtype=torch.long)
@@ -186,6 +203,17 @@ class MiniCPMO45Code2Wav(nn.Module):
         extra = self._extra_config()
         self._token2wav_n_timesteps = _parse_token2wav_n_timesteps(extra.get("token2wav_n_timesteps", 10))
         self._token2wav_float16 = _parse_token2wav_float16(extra.get("token2wav_float16", False))
+        self._npu_cfm_graph_config = {
+            "enabled": _parse_enable_token2wav_npu_cfm_graph(extra.get("enable_token2wav_npu_cfm_graph", False)),
+            "max_entries": _parse_positive_graph_budget(
+                extra.get("token2wav_npu_cfm_graph_max_entries", 4),
+                name="token2wav_npu_cfm_graph_max_entries",
+            ),
+            "max_bytes": _parse_positive_graph_budget(
+                extra.get("token2wav_npu_cfm_graph_max_bytes", 536870912),
+                name="token2wav_npu_cfm_graph_max_bytes",
+            ),
+        }
         self._connector_config = {
             "codec_chunk_frames": int(extra.get("codec_chunk_frames", 25)),
             "codec_left_context_frames": int(extra.get("codec_left_context_frames", 3)),
@@ -843,4 +871,5 @@ class MiniCPMO45Code2Wav(nn.Module):
             connector_config=self._connector_config,
             hift_graph_config=self._hift_graph_config,
             npu_flow_float16=use_npu_flow_autocast,
+            npu_cfm_graph_config=self._npu_cfm_graph_config,
         )

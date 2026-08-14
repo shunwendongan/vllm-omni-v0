@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from vllm.logger import init_logger
 
 from .cuda_graph_wrapper import HiFTGraphWrapper
+from .npu_cfm_graph import NPUCFMGraphRunner
 
 logger = init_logger(__name__)
 
@@ -74,6 +75,8 @@ class BatchedToken2Wav(nn.Module):
         connector_config: Mapping[str, int] | None = None,
         hift_graph_config: Mapping[str, Any] | None = None,
         npu_flow_float16: bool = False,
+        npu_cfm_graph_config: Mapping[str, Any] | None = None,
+        npu_cfm_graph_runtime: Any | None = None,
     ):
         super().__init__()
         self._token2wav = token2wav
@@ -116,6 +119,15 @@ class BatchedToken2Wav(nn.Module):
         }
         self.n_timesteps = int(token2wav.n_timesteps)
         self._timeline_cache: dict[tuple[int, str, int | None, torch.dtype], torch.Tensor] = {}
+        cfm_graph_config = dict(npu_cfm_graph_config or {})
+        self.npu_cfm_graph_runner = NPUCFMGraphRunner(
+            model_instance=token2wav,
+            steps=self.n_timesteps,
+            enabled=cfm_graph_config.get("enabled", False),
+            max_entries=cfm_graph_config.get("max_entries", 4),
+            max_bytes=cfm_graph_config.get("max_bytes", 536870912),
+            runtime=npu_cfm_graph_runtime,
+        )
         self.mel_cache_len = int(token2wav.mel_cache_len)
         self.source_cache_len = int(token2wav.source_cache_len)
         self.register_buffer(
@@ -213,6 +225,10 @@ class BatchedToken2Wav(nn.Module):
     def precision_telemetry(self) -> dict[str, int | str | None]:
         """Return Host-only NPU Flow precision state without device sync."""
         return dict(self._precision_telemetry)
+
+    def npu_cfm_graph_telemetry(self) -> dict[str, int | dict[str, int]]:
+        """Return bounded Host-only NPU CFM Graph telemetry."""
+        return self.npu_cfm_graph_runner.telemetry()
 
     def _record_npu_autocast_fallback(self, error: BaseException) -> None:
         if self._npu_autocast_available is False:
@@ -377,12 +393,11 @@ class BatchedToken2Wav(nn.Module):
             )
         return result, cnn_out, att_out
 
-    def _decode_cfm(
+    def _decode_cfm_eager(
         self,
         mu: torch.Tensor,
         speakers: torch.Tensor,
         cond: torch.Tensor,
-        *,
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -430,6 +445,33 @@ class BatchedToken2Wav(nn.Module):
             next_cnn.append(step_cnn)
             next_att.append(step_att)
         return x, torch.stack(next_cnn), torch.stack(next_att)
+
+    def _decode_cfm(
+        self,
+        mu: torch.Tensor,
+        speakers: torch.Tensor,
+        cond: torch.Tensor,
+        *,
+        cnn_cache: torch.Tensor | None,
+        att_cache: torch.Tensor | None,
+        source_tokens: torch.Tensor,
+        phase: str,
+        last_chunk: bool,
+        flush_encoder: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run only the pure CFM tensor subgraph through the optional cache."""
+        return self.npu_cfm_graph_runner.run(
+            eager_fn=self._decode_cfm_eager,
+            source_tokens=source_tokens,
+            mu=mu,
+            speakers=speakers,
+            cond=cond,
+            cnn_cache=cnn_cache,
+            att_cache=att_cache,
+            phase=phase,
+            last_chunk=last_chunk,
+            flush_encoder=flush_encoder,
+        )
 
     @staticmethod
     def _split_flow_cache(cache: dict[str, torch.Tensor], batch_size: int) -> list[dict[str, torch.Tensor]]:
@@ -483,8 +525,9 @@ class BatchedToken2Wav(nn.Module):
             _SILENCE_TOKEN,
         )
         with self._autocast(prompt_tokens.device):
+            prompt_input_tokens = torch.cat((prompt_tokens, lookahead), dim=1)
             hidden, conformer_cnn, conformer_att = self._encode_chunk(
-                torch.cat((prompt_tokens, lookahead), dim=1),
+                prompt_input_tokens,
                 last_chunk=False,
                 cnn_cache=None,
                 att_cache=None,
@@ -496,6 +539,10 @@ class BatchedToken2Wav(nn.Module):
                 prompt_mels.transpose(1, 2).contiguous(),
                 cnn_cache=None,
                 att_cache=None,
+                source_tokens=prompt_input_tokens,
+                phase="prompt",
+                last_chunk=False,
+                flush_encoder=False,
             )
         flow_cache = {
             "conformer_cnn_cache": conformer_cnn,
@@ -577,6 +624,10 @@ class BatchedToken2Wav(nn.Module):
                 cond,
                 cnn_cache=flow_cache["estimator_cnn_cache"],
                 att_cache=flow_cache["estimator_att_cache"],
+                source_tokens=tokens,
+                phase="stream",
+                last_chunk=last_chunk,
+                flush_encoder=flush_encoder,
             )
 
         prompt_len = int(features.mels.shape[1])

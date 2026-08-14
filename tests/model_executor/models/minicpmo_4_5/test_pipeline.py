@@ -165,6 +165,9 @@ class TestDeployTopology:
         if filename == "minicpmo_4_5.yaml":
             assert connector["extra"]["token2wav_n_timesteps"] == 10
             assert connector["extra"]["token2wav_float16"] is False
+            assert connector["extra"]["enable_token2wav_npu_cfm_graph"] is False
+            assert connector["extra"]["token2wav_npu_cfm_graph_max_entries"] == 4
+            assert connector["extra"]["token2wav_npu_cfm_graph_max_bytes"] == 536870912
             assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [4, 4, 4]
             memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
             assert memory_utilizations == [

@@ -18,6 +18,11 @@ connectors:
       token2wav_n_timesteps: 10
       # NPU-only Flow autocast experiment. HiFT and waveform stay FP32.
       token2wav_float16: false
+      # NPU-only exact-shape CFM Graph experiment. Stage 2 remains eager and
+      # unsupported/capture-failed keys preserve the eager CFM semantics.
+      enable_token2wav_npu_cfm_graph: false
+      token2wav_npu_cfm_graph_max_entries: 4
+      token2wav_npu_cfm_graph_max_bytes: 536870912
       # HiFT capture buckets are derived from codec_chunk_frames and
       # codec_left_context_frames. (#5869)
       # A future initial_codec_chunk_frames shape will use lazy capture unless
