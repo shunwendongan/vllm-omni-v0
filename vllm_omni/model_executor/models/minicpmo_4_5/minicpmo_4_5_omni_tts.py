@@ -118,6 +118,18 @@ def _apply_repetition_penalty(
     return torch.where(logits < 0, logits * alpha, logits / alpha)
 
 
+_BATCH_PENALTY_DEV: torch.Tensor | None = None
+
+
+def _get_batch_penalty_dev(penalty: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Lazily cache the per-call penalty scalar on device (X1: drop the
+    repeated host->device tensor creation in the batched penalty loop)."""
+    global _BATCH_PENALTY_DEV
+    if _BATCH_PENALTY_DEV is None or _BATCH_PENALTY_DEV.device != device or _BATCH_PENALTY_DEV.dtype != dtype:
+        _BATCH_PENALTY_DEV = torch.as_tensor(penalty, device=device, dtype=dtype)
+    return _BATCH_PENALTY_DEV
+
+
 def _apply_batched_repetition_penalty(
     logits: torch.Tensor,
     histories: Sequence[torch.Tensor],
@@ -144,7 +156,7 @@ def _apply_batched_repetition_penalty(
         return logits
 
     penalized = logits.clone()
-    penalty_tensor = torch.as_tensor(penalty, device=logits.device, dtype=logits.dtype)
+    penalty_tensor = _get_batch_penalty_dev(penalty, logits.device, logits.dtype)
     for start in range(0, batch_size, _REPETITION_PENALTY_CHUNK_SIZE):
         end = min(start + _REPETITION_PENALTY_CHUNK_SIZE, batch_size)
         chunk_logits = logits[start:end]
