@@ -44,7 +44,7 @@ stages:
     top_p: 1.0
   speculative_config:
     method: ngram
-    num_speculative_tokens: 4
+    num_speculative_tokens: 7
     prompt_lookup_max: 5
     prompt_lookup_min: 1
   async_scheduling: false
