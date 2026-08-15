@@ -472,7 +472,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
-        self._omni_async_step_budget = int(os.environ.get("VLLM_OMNI_NPU_ASYNC_OUTPUT_STEPS", "40"))
+        self._omni_async_step_budget = int(os.environ.get("VLLM_OMNI_NPU_ASYNC_OUTPUT_STEPS", "48"))
         self._omni_async_steps: dict[str, int] = {}
 
         _OMNI_CONNECTOR_INIT_ARCHS = {

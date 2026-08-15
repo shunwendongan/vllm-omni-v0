@@ -343,7 +343,7 @@ class AsyncOmniEngine:
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
         if os.environ.get("W4_PREWARM", "0") == "1" and not getattr(self, "_w4_prewarm_fired", False):
             self._w4_prewarm_fired = True
-            port = int(os.environ.get("W4_PREWARM_PORT", "8094"))
+            port = int(os.environ.get("W4_PREWARM_PORT", "8091"))
             threading.Thread(target=_w4_full_chain_prewarm, args=(port,), daemon=True).start()
 
 
