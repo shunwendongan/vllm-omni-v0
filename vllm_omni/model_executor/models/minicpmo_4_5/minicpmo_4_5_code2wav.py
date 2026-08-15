@@ -800,6 +800,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         self.backend = BatchedToken2Wav(token2wav)
         self._maybe_warmup_hift()
         self._maybe_preseed_setup_batch()
+        self._maybe_preseed_all_refs()
         self._maybe_prewarm_chain()
 
     def _maybe_warmup_hift(self) -> None:
@@ -839,6 +840,67 @@ class MiniCPMO45Code2Wav(nn.Module):
                 exc_info=True,
             )
         del mel, cache_source
+
+
+    def _maybe_preseed_all_refs(self) -> None:
+        """Startup preseed of all unique seed-tts refs into the N1 prompt cache.
+
+        Lazy prepare_prompt warms only refs seen by warmup requests; a
+        32-prompt bench with ~21 unique refs leaves ~19 first requests cold
+        (~40-90ms S3Tokenizer each). Scan the seed-tts manifest and warm every
+        unique ref through the exact runtime path so cache keys match.
+        Gated by VLLM_OMNI_PRESEED_ALL_REFS=1; failures warn only.
+        """
+        import os
+
+        if os.environ.get("VLLM_OMNI_PRESEED_ALL_REFS", "0") != "1":
+            return
+        root = os.environ.get("SEED_TTS_ROOT", "/root/seed-tts-eval/seedtts_testset").strip()
+        if not root or not os.path.isdir(root):
+            logger.warning("[preseed] SEED_TTS_ROOT=%r not a directory; skipping", root)
+            return
+        backend = getattr(self, "backend", None)
+        if backend is None or not hasattr(backend, "prepare_prompt"):
+            logger.warning("[preseed] backend without prepare_prompt; skipping")
+            return
+        import soundfile as _sf
+
+        refs: set[tuple[str, str]] = set()
+        for locale in ("en", "zh"):
+            meta = os.path.join(root, locale, "meta.lst")
+            if not os.path.isfile(meta):
+                continue
+            try:
+                with open(meta, encoding="utf-8") as fh:
+                    for line in fh:
+                        parts = line.rstrip("\n").split("|")
+                        if len(parts) >= 3:
+                            refs.add((locale, parts[2].strip()))
+            except Exception as exc:
+                logger.warning("[preseed] manifest read failed %s: %s", meta, exc)
+        if not refs:
+            logger.warning("[preseed] no refs found under %r", root)
+            return
+
+        ok = 0
+        for locale, ref in sorted(refs):
+            if not ref:
+                continue
+            wav_path = ref if os.path.isabs(ref) else os.path.join(root, locale, ref)
+            if not os.path.isfile(wav_path):
+                logger.warning("[preseed] ref wav missing: %s/%s", locale, ref)
+                continue
+            try:
+                data, sr = _sf.read(wav_path, dtype="float32")
+                waveform = torch.as_tensor(data, dtype=torch.float32).reshape(-1)
+                cache_key, entry = self._materialize_runtime_prompt(waveform, sr)
+                backend.prepare_prompt(entry.cache_id, entry.path)
+                ok += 1
+            except Exception as exc:
+                logger.warning("[preseed] ref failed %s/%s: %s", locale, ref, exc)
+        logger.info(
+            "[preseed] preseeded %d/%d unique refs (root=%s)", ok, len(refs), root
+        )
 
     def _maybe_preseed_setup_batch(self) -> None:
         """Pre-warm the setup_batch (Conformer+CFM prompt decode) cache for the
