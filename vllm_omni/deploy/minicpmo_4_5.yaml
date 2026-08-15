@@ -42,6 +42,12 @@ stages:
     temperature: 0.0
     top_k: -1
     top_p: 1.0
+  speculative_config:
+    method: ngram
+    num_speculative_tokens: 4
+    prompt_lookup_max: 5
+    prompt_lookup_min: 1
+  async_scheduling: false
   devices: '0'
   enforce_eager: false
   gpu_memory_utilization: 0.55
