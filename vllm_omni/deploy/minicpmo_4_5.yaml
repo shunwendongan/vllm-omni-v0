@@ -19,7 +19,7 @@ platforms:
     stages:
     - compilation_config:
         cudagraph_mode: FULL_DECODE_ONLY
-        cudagraph_capture_sizes: [17, 34, 68, 136]
+        cudagraph_capture_sizes: [1, 2, 4, 8]
       additional_config:
         ascend_compilation_config:
           enable_static_kernel: true
@@ -27,7 +27,7 @@ platforms:
       stage_id: 0
     - compilation_config:
         cudagraph_mode: FULL_DECODE_ONLY
-        cudagraph_capture_sizes: [17, 34, 68, 136]
+        cudagraph_capture_sizes: [1, 2, 4, 8]
       additional_config:
         ascend_compilation_config:
           enable_static_kernel: true
@@ -44,7 +44,7 @@ stages:
     top_p: 1.0
   speculative_config:
     method: ngram
-    num_speculative_tokens: 16
+    num_speculative_tokens: 4
     prompt_lookup_max: 5
     prompt_lookup_min: 1
   async_scheduling: false
