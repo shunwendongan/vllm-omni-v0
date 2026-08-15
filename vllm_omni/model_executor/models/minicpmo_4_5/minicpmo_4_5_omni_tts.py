@@ -114,7 +114,7 @@ def _apply_repetition_penalty(
     """
     if penalty == 1.0:
         return logits
-    alpha = torch.pow(torch.as_tensor(penalty, device=logits.device, dtype=logits.dtype), frequencies)
+    alpha = torch.pow(_get_batch_penalty_dev(penalty, logits.device, logits.dtype), frequencies)
     return torch.where(logits < 0, logits * alpha, logits / alpha)
 
 
