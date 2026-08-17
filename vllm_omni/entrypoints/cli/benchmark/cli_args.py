@@ -168,6 +168,18 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
         "Default follows official Qwen3-Omni identity + zero-shot voice-clone instructions.",
     )
     group.add_argument(
+        "--seed-tts-reference-audio-placement",
+        type=str,
+        choices=["body", "system-message"],
+        default="body",
+        help=(
+            "Where Seed-TTS voice-clone reference audio is sent. 'body' keeps the "
+            "existing ref_audio/ref_text request fields. 'system-message' places the "
+            "reference audio in the chat system turn and requires "
+            "--backend openai-chat-omni."
+        ),
+    )
+    group.add_argument(
         "--seed-tts-wer-eval",
         action="store_true",
         default=False,

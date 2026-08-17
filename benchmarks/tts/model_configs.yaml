@@ -7,6 +7,22 @@
 # is tracked here.
 
 models:
+  # MiniCPM-o 4.5 follows its official audio-assistant chat contract: the
+  # reference voice is an audio_url in the system turn, not a speech-API body
+  # field. The user turn contains only the Seed-TTS target text.
+  openbmb/MiniCPM-o-4_5:
+    supported_tasks: [voice_clone]
+    backend: openai-chat-omni
+    endpoint: /v1/chat/completions
+    trust_remote_code: true
+    seed_tts_reference_audio_placement: system-message
+    task_extra_body:
+      voice_clone:
+        modalities: [text, audio]
+        chat_template_kwargs:
+          use_tts_template: true
+          enable_thinking: false
+
   IndexTeam/IndexTTS-2.5:
     supported_tasks: [voice_clone]
     backend: openai-audio-speech
