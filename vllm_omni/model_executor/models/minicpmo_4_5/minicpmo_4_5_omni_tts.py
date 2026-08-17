@@ -204,6 +204,9 @@ def _apply_top_k_top_p(
     return filtered
 
 
+_NPU_TOPK_CACHE: dict = {}
+
+
 def _npu_top_k_top_p_warp(
     logits: torch.Tensor,
     *,
