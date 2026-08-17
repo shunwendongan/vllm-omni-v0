@@ -226,10 +226,23 @@ def _npu_top_k_top_p_warp(
     npu = getattr(torch_npu, "npu_top_k_top_p", None)
     if npu is None:
         return logits
-    p = torch.full((logits.shape[0],), float(top_p), device=logits.device, dtype=logits.dtype)
-    k = torch.full((logits.shape[0],), int(top_k), device=logits.device, dtype=torch.int32)
+    # C5: top_p/top_k are constants — cache per-(device, dtype) device tensors
+    # instead of rebuilding + H2D every decode step.
+    _cache = _NPU_TOPK_CACHE
+    key = (str(logits.device), str(logits.dtype), float(top_p), int(top_k))
+    cached = _cache.get(key)
+    if cached is None:
+        p = torch.full((1,), float(top_p), device=logits.device, dtype=logits.dtype)
+        k = torch.full((1,), int(top_k), device=logits.device, dtype=torch.int32)
+        _cache[key] = (p, k)
+    else:
+        p, k = cached
     try:
-        return npu(logits, p, k)
+        return npu(
+            logits,
+            p.expand(logits.shape[0]).contiguous(),
+            k.expand(logits.shape[0]).contiguous(),
+        )
     except Exception:
         # A kernel failure must not silently change the sampling
         # distribution; fall back to the exact PyTorch warper.
@@ -892,16 +905,19 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         for row, pending in enumerate(pending_samples):
             sampled = sampled_batch[row].reshape(())
-            sampled_id = int(sampled_ids[row])
             codes = pending.codes
             state = pending.state
             info = pending.info
-            # O2: Skip D2H sync for steps < min_tokens (greedy by design)
+            # O2: defer host sync of sampled_id until the min_tokens boundary —
+            # inside min_tokens the EOS comparison is known-false, so the
+            # .item() D2H sync is skipped for those steps.
             _min_tts = int(state.get("min_tokens", self._codec_min_tokens))
             _step = int(state.get("step", 0))
             if _step >= _min_tts:
+                sampled_id = int(sampled_ids[row])
                 is_eos = sampled_id == self._num_audio_tokens - 1
             else:
+                sampled_id = None
                 is_eos = False
             state["step"] = int(state.get("step", 0)) + 1
             reached_limit = int(state["step"]) >= int(state.get("max_tokens", 2048))

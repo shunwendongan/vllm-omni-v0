@@ -554,7 +554,7 @@ class BatchedToken2Wav(nn.Module):
         flow_cache = self._stack_flow_cache(states)
         speakers = features.speaker_embedding.expand(batch_size, -1)
         _t0 = _time.time()
-        _tlog.info("decode_batch START tokens=%s", str(list(tokens.shape)))
+        _tlog.debug("decode_batch START tokens=%s", str(list(tokens.shape)))
         with self._autocast(tokens.device):
             hidden, conformer_cnn, conformer_att = self._encode_chunk(
                 tokens,
@@ -573,7 +573,7 @@ class BatchedToken2Wav(nn.Module):
                 att_cache=flow_cache["estimator_att_cache"],
             )
             _t_cfm_end = _time.time()
-            _tlog.info("CFM done: %.2fs", _t_cfm_end - _t_cfm_start)
+            _tlog.debug("CFM done: %.2fs", _t_cfm_end - _t_cfm_start)
 
         prompt_len = int(features.mels.shape[1])
         if estimator_att.shape[4] > prompt_len + 100:
