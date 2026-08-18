@@ -12,7 +12,7 @@ connectors:
       token2wav_n_timesteps: 2
       enable_hift_warmup: true
       talker_local_decode_stage_id: 1
-      talker_local_decode_steps: 8
+      talker_local_decode_steps: 16
       talker_local_cpu_slot_mapping: true
       talker_binary_argmax: true
       talker_debug_trace: 0
