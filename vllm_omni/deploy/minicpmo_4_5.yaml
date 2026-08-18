@@ -11,6 +11,12 @@ connectors:
       token2wav_float16: true
       token2wav_n_timesteps: 2
       enable_hift_warmup: true
+      talker_local_decode_stage_id: 1
+      talker_local_decode_steps: 1
+      talker_local_cpu_slot_mapping: true
+      talker_binary_argmax: true
+      talker_debug_trace: 1
+      talker_dump_dir: /root/r5/dump_k2
     name: SharedMemoryConnector
 enable_prefix_caching: false
 pipeline: minicpmo_4_5
@@ -27,7 +33,7 @@ platforms:
       stage_id: 0
     - compilation_config:
         cudagraph_mode: FULL_DECODE_ONLY
-        cudagraph_capture_sizes: [8, 16, 32, 64]
+        cudagraph_capture_sizes: [1, 2, 4, 8]
       additional_config:
         ascend_compilation_config:
           enable_static_kernel: true

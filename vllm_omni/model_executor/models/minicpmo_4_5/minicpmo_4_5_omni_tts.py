@@ -329,6 +329,21 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._request_generators: dict[str, torch.Generator] = {}
         self._request_audio_states: dict[str, dict[str, Any]] = {}
         self._deferred_cleanup_ids: set[str] = set()
+        self._talker_debug_trace = False
+        try:
+            _cc = getattr(vllm_config, "model_config", None)
+            _cc2 = getattr(_cc, "stage_connector_config", None)
+            if isinstance(_cc2, dict):
+                _extra = _cc2.get("extra", _cc2)
+            else:
+                _extra = getattr(_cc2, "extra", None)
+            if isinstance(_extra, dict):
+                _tv = _extra.get("talker_debug_trace")
+                if isinstance(_tv, str):
+                    _tv = _tv.strip().lower() in ("1", "true", "yes", "on")
+                self._talker_debug_trace = bool(_tv)
+        except Exception:
+            self._talker_debug_trace = False
 
         tts_config = getattr(config, "tts_config", None)
         if tts_config is None and getattr(config, "model_type", None) == "minicpmtts":
@@ -590,6 +605,19 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             return torch.empty(0, dtype=torch.long, device=hidden_states.device)
 
         logits = self.head_code[0](hidden_states).float() * self._codec_scale
+        if os.environ.get("OMNI_TALKER_DEBUG_TRACE", "0") == "1" or bool(
+            getattr(self, "_talker_debug_trace", False)
+        ):
+            import logging as _lg
+
+            for _r in range(batch_size):
+                _lg.getLogger("vllm").info(
+                    "[LOGITS] req=%s step=%d top5=%s hid0=%.4f hid1=%.4f",
+                    request_ids[_r], steps[_r],
+                    str(logits[_r].topk(5).indices.detach().cpu().tolist()),
+                    float(hidden_states[_r, 0].detach().cpu()),
+                    float(hidden_states[_r, 1].detach().cpu()),
+                )
         eos_id = self._num_audio_tokens - 1
         request_states = getattr(self, "_request_audio_states", {})
         # Cold-start each request's persistent freq histogram exactly as the
@@ -730,6 +758,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 noise = grow if noise is None else torch.cat([noise, grow], dim=0)
                 if isinstance(state, dict):
                     state["gumbel"] = noise
+            if os.environ.get("OMNI_TALKER_DEBUG_TRACE", "0") == "1" or bool(
+                getattr(self, "_talker_debug_trace", False)
+            ):
+                import logging as _lg
+
+                _lg.getLogger("vllm").info(
+                    "[GUMBEL] req=%s step=%d noise_row0=%.4f noise_row1=%.4f history_len=%d",
+                    request_id, step,
+                    float(noise[step, 0].detach().cpu()) if noise.numel() else float("nan"),
+                    float(noise[step, 1].detach().cpu()) if noise.numel() > 1 else float("nan"),
+                    int(histories[row].numel()) if histories[row] is not None else -1,
+                )
             logits[row : row + 1].add_(noise[step : step + 1])
         return logits.argmax(-1).reshape(-1)
 

@@ -711,7 +711,29 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         model = getattr(self, "model", None)
         if model is None:
             return None
+        # ACLGraphWrapper forwards attribute access to its runnable via
+        # __getattr__, but the cached stop logits are set at runtime on the
+        # wrapped model; read through unwrap() to be safe.
+        unwrap = getattr(model, "unwrap", None)
+        if callable(unwrap):
+            try:
+                model = unwrap()
+            except Exception:
+                pass
+        # The top-level MiniCPM-o model forwards make_omni_output to its
+        # `talker` sub-model, which owns _batch_stop_logits.
         cached = getattr(model, "_batch_stop_logits", None)
+        if cached is None:
+            talker = getattr(model, "talker", None)
+            if talker is not None:
+                cached = getattr(talker, "_batch_stop_logits", None)
+        if getattr(self, "_talker_debug_trace", False) or os.environ.get("OMNI_TALKER_DEBUG_TRACE", "0") == "1":
+            logger.info(
+                "[TALKER-BSL] model=%s cached=%s numel=%s",
+                type(model).__name__,
+                "None" if cached is None else "set",
+                "n/a" if cached is None else str(cached.numel()),
+            )
         if cached is None or cached.numel() == 0:
             return None
         return cached.detach()
@@ -757,6 +779,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # advance counters (runner-local view; engine counter syncs via the
         # next step's schedule, see docstring)
         self.input_batch.num_computed_tokens_cpu[req_idx] = new_pos
+        # sync the GPU counter tensor (the kernel path reads it; leaving it
+        # stale by one makes local-step attention see the pre-window value)
+        if hasattr(self, "num_computed_tokens"):
+            self.num_computed_tokens[req_idx].fill_(new_pos)
         # positions / seq_lens / optimistic seq lens for this request's row
         self.positions[req_idx].fill_(new_pos)
         self.seq_lens[req_idx].fill_(new_pos + 1)
@@ -915,6 +941,21 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         num_scheduled_tokens_np=np.ones(num_reqs, dtype=np.int32),
                     )
                     update_cos_sin(self.positions[:num_reqs])
+                    if os.environ.get("OMNI_TALKER_DEBUG_TRACE", "0") == "1" or getattr(
+                        self, "_talker_debug_trace", False
+                    ):
+                        try:
+                            logger.info(
+                                "[TALKER-META] step=%d/%d pos=%s seq_lens=%s opt=%s num_comp_cpu=%s num_comp_gpu=%s",
+                                step_idx, window,
+                                [int(self.positions[i]) for i in range(num_reqs)],
+                                [int(self.seq_lens[i]) for i in range(num_reqs)],
+                                [int(self.optimistic_seq_lens_cpu[i]) for i in range(num_reqs)],
+                                [int(self.input_batch.num_computed_tokens_cpu[i]) for i in range(num_reqs)],
+                                [int(self.num_computed_tokens[i]) for i in range(num_reqs)],
+                            )
+                        except Exception:
+                            pass
                     with (
                         record_function_or_nullcontext("talker_local_forward"),
                         set_ascend_forward_context(
@@ -943,6 +984,18 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
                     # engine token: read cached stop logits WITHOUT consuming
                     tok = self._talker_local_engine_token(hidden_states[:num_reqs])
+                    if os.environ.get("OMNI_TALKER_DEBUG_TRACE", "0") == "1" or getattr(
+                        self, "_talker_debug_trace", False
+                    ):
+                        try:
+                            _bsl = self._batch_stop_logits_snapshot()
+                            logger.info(
+                                "[TALKER-TOK] step=%d/%d tok=%s bsl=%s",
+                                step_idx, window, tok,
+                                str(_bsl.detach().cpu().tolist()) if _bsl is not None else None,
+                            )
+                        except Exception:
+                            pass
                     collect_step_outputs(multimodal_outputs, tokens_override=tok)
                     if os.environ.get("OMNI_TALKER_DEBUG_TRACE", "0") == "1" or getattr(
                         self, "_talker_debug_trace", False
@@ -957,10 +1010,11 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                                     if isinstance(_d, torch.Tensor):
                                         _dbg_vals.append(int(_d.reshape(-1)[0]) if _d.numel() else -1)
                             logger.info(
-                                "[TALKER-LOCAL] from_scratch step=%d/%d pos=%s tok=%s codec=%s",
+                                "[TALKER-LOCAL] from_scratch step=%d/%d pos=%s tok=%s codec=%s fin_flags=%s",
                                 step_idx, window,
                                 [int(self.positions[i]) for i in range(num_reqs)],
                                 tok, _dbg_vals,
+                                [f[-1] if f else None for f in finished_flags],
                             )
                         except Exception:
                             pass
