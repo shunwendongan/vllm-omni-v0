@@ -516,6 +516,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self._talker_binary_argmax = True
         self._talker_debug_trace = False
         self._talker_dump_dir: str | None = None
+        self._talker_e3 = False
         try:
             model_cfg = getattr(self.vllm_config, "model_config", None)
             connector_cfg = getattr(model_cfg, "stage_connector_config", None)
@@ -555,6 +556,13 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             dump_cfg = extra_cfg.get("talker_dump_dir")
             if isinstance(dump_cfg, str) and dump_cfg.strip():
                 self._talker_dump_dir = dump_cfg.strip()
+            e3_cfg = extra_cfg.get("talker_e3")
+            if isinstance(e3_cfg, str):
+                e3_cfg = e3_cfg.strip().lower() in ("1", "true", "yes", "on")
+            if isinstance(e3_cfg, bool):
+                self._talker_e3 = e3_cfg
+            elif isinstance(e3_cfg, int):
+                self._talker_e3 = bool(e3_cfg)
         except Exception:  # pragma: no cover - config best-effort
             logger.warning("Failed to parse talker local decode config; keeping defaults", exc_info=True)
         # env kill switch: OMNI_TALKER_LOCAL_DECODE=0 disables; OMNI_TALKER_LOCAL_STEPS overrides K
@@ -892,6 +900,11 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         saved_nstp = getattr(self, "_omni_num_scheduled_tokens_np", None)
         self._omni_num_scheduled_tokens_np = np.ones(num_reqs, dtype=np.int32)
 
+        # E3 timing: measure per-step host cost breakdown (config-gated, off default)
+        _e3 = os.environ.get("OMNI_TALKER_E3", "0") == "1" or getattr(self, "_talker_e3", False)
+        _e3_t0 = time.perf_counter()
+        _e3_acc = {"feedback": 0.0, "metadata": 0.0, "cos": 0.0, "forward": 0.0, "tok": 0.0, "collect": 0.0}
+
         local_batch_desc: Any = None
         try:
             if from_scratch:
@@ -925,9 +938,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 for step_idx in range(window):
                     # refresh inputs: step 0 uses the scheduled row-0 embeds;
                     # steps 1..W-1 get the freshly sampled codec embed
+                    if _e3:
+                        _t = time.perf_counter()
                     if step_idx > 0:
                         for i in range(num_reqs):
                             self._talker_local_step_feedback(i, step_idx)
+                    if _e3:
+                        _e3_acc["feedback"] += time.perf_counter() - _t
+                        _t = time.perf_counter()
                     local_metadata, _ = self._build_attention_metadata(
                         num_tokens=num_reqs,
                         num_tokens_padded=num_reqs,
@@ -940,7 +958,13 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         num_scheduled_tokens={rid: 1 for rid in req_ids[:num_reqs]},
                         num_scheduled_tokens_np=np.ones(num_reqs, dtype=np.int32),
                     )
+                    if _e3:
+                        _e3_acc["metadata"] += time.perf_counter() - _t
+                        _t = time.perf_counter()
                     update_cos_sin(self.positions[:num_reqs])
+                    if _e3:
+                        _e3_acc["cos"] += time.perf_counter() - _t
+                        _t = time.perf_counter()
                     if os.environ.get("OMNI_TALKER_DEBUG_TRACE", "0") == "1" or getattr(
                         self, "_talker_debug_trace", False
                     ):
@@ -981,9 +1005,15 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                             inputs_embeds=self.inputs_embeds.gpu[:num_reqs],
                             **model_kwargs,
                         )
+                    if _e3:
+                        _e3_acc["forward"] += time.perf_counter() - _t
+                        _t = time.perf_counter()
                     hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
                     # engine token: read cached stop logits WITHOUT consuming
                     tok = self._talker_local_engine_token(hidden_states[:num_reqs])
+                    if _e3:
+                        _e3_acc["tok"] += time.perf_counter() - _t
+                        _t = time.perf_counter()
                     if os.environ.get("OMNI_TALKER_DEBUG_TRACE", "0") == "1" or getattr(
                         self, "_talker_debug_trace", False
                     ):
@@ -997,6 +1027,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         except Exception:
                             pass
                     collect_step_outputs(multimodal_outputs, tokens_override=tok)
+                    if _e3:
+                        _e3_acc["collect"] += time.perf_counter() - _t
                     if os.environ.get("OMNI_TALKER_DEBUG_TRACE", "0") == "1" or getattr(
                         self, "_talker_debug_trace", False
                     ):
@@ -1090,6 +1122,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         finally:
             if saved_nstp is not None:
                 self._omni_num_scheduled_tokens_np = saved_nstp
+
+        if _e3:
+            _total = time.perf_counter() - _e3_t0
+            logger.info(
+                "[E3] window=%d total=%.3fms step_avg=%.3fms breakdown=%s",
+                window, _total * 1000, (_total / max(window, 1)) * 1000,
+                {k: round(v * 1000, 3) for k, v in _e3_acc.items()},
+            )
 
         # merge codec deltas into per-request (W,1) tensors and keep the last
         # step's finished flags

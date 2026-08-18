@@ -15,8 +15,9 @@ connectors:
       talker_local_decode_steps: 1
       talker_local_cpu_slot_mapping: true
       talker_binary_argmax: true
-      talker_debug_trace: 1
+      talker_debug_trace: 0
       talker_dump_dir: /root/r5/dump_k2
+      talker_e3: 0
     name: SharedMemoryConnector
 enable_prefix_caching: false
 pipeline: minicpmo_4_5
@@ -82,6 +83,7 @@ stages:
     top_k: -1
     top_p: 1.0
   devices: '0'
+  async_scheduling: false
   enforce_eager: false
   gpu_memory_utilization: 0.15
   max_model_len: 4096
