@@ -581,6 +581,38 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 self._talker_cpu_slot_mapping,
                 self._talker_debug_trace,
             )
+        # MECHA (机制 A): K-window sub-step prebuild. Env-gated; master kill
+        # switch OMNI_TALKER_MECHA=0 disables everything; each point is
+        # independently killable (META/COS/TOK/COLLECT) for bisection.
+        _mecha_master = os.environ.get("OMNI_TALKER_MECHA", "1").strip().lower() not in (
+            "0", "false", "no", "off"
+        )
+        self._mecha_enabled = _mecha_master and self._talker_local_steps > 1
+        self._mecha_meta = _mecha_master and os.environ.get(
+            "OMNI_TALKER_MECHA_META", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        self._mecha_cos = _mecha_master and os.environ.get(
+            "OMNI_TALKER_MECHA_COS", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        self._mecha_tok = _mecha_master and os.environ.get(
+            "OMNI_TALKER_MECHA_TOK", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        self._mecha_collect = _mecha_master and os.environ.get(
+            "OMNI_TALKER_MECHA_COLLECT", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        self._mecha_light = _mecha_master and os.environ.get(
+            "OMNI_TALKER_MECHA_LIGHT", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        self._talker_light_next = False
+        if _mecha_master:
+            logger.info(
+                "Talker MECHA (机制 A) ENABLED: meta=%s cos=%s tok=%s collect=%s light=%s",
+                self._mecha_meta,
+                self._mecha_cos,
+                self._mecha_tok,
+                self._mecha_collect,
+                self._mecha_light,
+            )
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
@@ -811,6 +843,195 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         except Exception as exc:  # never let feedback break the request
             logger.warning("talker local feedback preprocess failed: %s", exc)
 
+    #  -------------------------------------- MECHA (机制 A) -----------------------------------------
+    # K-window sub-step prebuild. Per-step attention metadata objects built
+    # once at window start (each an INDEPENDENT copy carrying its own
+    # step-varying fields — the O31 reuse trap was sharing one object whose
+    # step state went stale; here each object owns its seq_lens), cos/sin table
+    # precomputed for the whole window position range, engine STOP/CONTINUE
+    # tokens read from the shared per-request state (make_omni_output derives
+    # _batch_stop_logits FROM state['finished'], so the argmax + D2H tolist is
+    # redundant), and a light per-step collect. All gated by OMNI_TALKER_MECHA
+    # + per-point env; every path falls back to the original implementation on
+    # any surprise (correctness first; bit-identity verified by dump compare).
+    # -------------------------------------------------------------------------------------------------
+
+    def _mecha_prebuild_metadata(
+        self, num_reqs: int, req_ids: list[str], window: int
+    ) -> Any | None:
+        """Build `window` independent per-step attention-metadata dicts.
+
+        Base = the real builder at the CURRENT buffer state (exactly what the
+        loop's step-0 build would produce). Steps 1..W-1 are shallow copies of
+        each per-layer AscendMetadata with only the step-varying fields
+        (seq_lens_list / seq_lens / seq_lens_cpu) refreshed to base+j. For a
+        pure decode window everything else is step-invariant: slot_mapping and
+        block_tables are LIVE views of the runner buffers (feedback keeps them
+        current), query_start_loc / attn_mask / attn_state are static, and FIA
+        replay consumes only seq_lens_list + actual_seq_lengths_q per layer.
+        Returns None on any failure (caller falls back to per-step builds).
+        """
+        try:
+            base_meta, _ = self._build_attention_metadata(
+                num_tokens=num_reqs,
+                num_tokens_padded=num_reqs,
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs,
+                max_query_len=1,
+                ubatch_slices=None,
+                logits_indices=None,
+                use_spec_decode=False,
+                num_scheduled_tokens={rid: 1 for rid in req_ids},
+                num_scheduled_tokens_np=np.ones(num_reqs, dtype=np.int32),
+            )
+            if not isinstance(base_meta, Mapping) or not base_meta:
+                return None
+            base_lens = [
+                int(self.optimistic_seq_lens_cpu[i])
+                if hasattr(self, "optimistic_seq_lens_cpu")
+                else int(self.seq_lens[i])
+                for i in range(num_reqs)
+            ]
+            steps: list[Any] = []
+            for j in range(window):
+                meta_j: dict[str, Any] = {}
+                for key, md in base_meta.items():
+                    cm = copy(md)
+                    seq_lens_j = [base_lens[i] + j for i in range(num_reqs)]
+                    cm.seq_lens_list = list(seq_lens_j)
+                    # replicate the builder's FIA TND dummy-request padding
+                    pad = len(md.seq_lens_list) - num_reqs
+                    if pad > 0:
+                        cm.seq_lens_list += [1] * pad
+                    sl_t = md.seq_lens.new_tensor(seq_lens_j)
+                    cm.seq_lens = sl_t
+                    cm.seq_lens_cpu = sl_t
+                    # the builder's build() prefers _seq_lens_cpu when set;
+                    # refresh it on the copy so no consumer sees stale values
+                    if hasattr(cm, "_seq_lens_cpu"):
+                        cm._seq_lens_cpu = sl_t
+                    if hasattr(cm, "max_seq_len"):
+                        cm.max_seq_len = max(seq_lens_j)
+                    meta_j[key] = cm
+                steps.append(meta_j)
+            return steps
+        except Exception as exc:  # never let prebuild break the request
+            logger.warning("talker mecha prebuild metadata failed, falling back: %s", exc)
+            return None
+
+    def _mecha_cos_prepare(self, window: int, pos_start: int) -> bool:
+        """Precompute _cos/_sin rows 0..W-1 for positions pos_start..+W-1.
+
+        The captured 1-token decode graph reads row 0 of the base _cos/_sin
+        buffers at replay; per step j the loop would call
+        update_cos_sin(positions=[pos_start+j]), which index_selects one row
+        from the cache and expands it. Prebuilding fills all W rows once and
+        each step becomes a single row copy. Returns False when the rotary
+        globals are not ready (caller keeps calling update_cos_sin per step).
+        """
+        try:
+            import vllm_ascend.ops.rotary_embedding as _rot
+            if (
+                getattr(_rot, "_cos", None) is None
+                or getattr(_rot, "_sin", None) is None
+                or getattr(_rot, "_cos_sin_cache", None) is None
+            ):
+                return False
+            all_pos = torch.tensor(
+                [pos_start + j for j in range(window)], dtype=torch.long
+            )
+            update_cos_sin(all_pos)  # fills _cos[:, 0:W] and _sin[:, 0:W]
+            return getattr(_rot, "_cos", None) is not None
+        except Exception:
+            return False
+
+    def _mecha_cos_step(self, j: int) -> None:
+        """Per-step row copy: move precomputed row j into row 0 (the rows the
+        captured 1-token graph reads at replay). Same device values as a fresh
+        update_cos_sin(positions=[pos_start+j])."""
+        import vllm_ascend.ops.rotary_embedding as _rot
+        _rot._cos[:, :1].copy_(_rot._cos[:, j : j + 1])
+        _rot._sin[:, :1].copy_(_rot._sin[:, j : j + 1])
+
+    def _mecha_engine_tokens(
+        self, num_reqs: int, req_ids: list[str], hidden_rows: torch.Tensor | None = None
+    ) -> list[int]:
+        """Engine STOP/CONTINUE token per request from the shared per-request
+        state. make_omni_output assembles _batch_stop_logits FROM
+        state['finished'] (row 0 = [-inf,0] -> STOP token 1; row 1 = [0,-inf] ->
+        CONTINUE token 0), so the engine token is exactly int(finished),
+        already known on the host — the argmax + D2H tolist in
+        _talker_local_engine_token is pure overhead. Trace mode cross-checks
+        against the device snapshot and warns on any mismatch; any exception
+        falls back to the device path (never return a guessed token)."""
+        toks: list[int] = []
+        ok = True
+        try:
+            for i in range(num_reqs):
+                rid = req_ids[i]
+                infos = self.model_intermediate_buffer.get(rid, {})
+                st = infos.get("audio_state")
+                if not isinstance(st, dict):
+                    ok = False
+                    break
+                fin = bool(st.get("finished"))
+                toks.append(1 if fin else 0)
+        except Exception:
+            ok = False
+        if not ok or len(toks) != num_reqs:
+            return self._talker_local_engine_token(hidden_rows)
+        if (
+            getattr(self, "_talker_debug_trace", False)
+            or os.environ.get("OMNI_TALKER_DEBUG_TRACE", "0") == "1"
+        ):
+            try:
+                if hidden_rows is not None:
+                    ref = self._talker_local_engine_token(hidden_rows)
+                    for i in range(min(len(ref), len(toks))):
+                        if ref[i] != toks[i]:
+                            logger.warning(
+                                "[TALKER-MECHA] engine-token mismatch req=%s state=%s device=%s",
+                                req_ids[i] if i < len(req_ids) else "?",
+                                toks[i],
+                                ref[i],
+                            )
+            except Exception:
+                pass
+        return toks
+
+    def _mecha_collect(
+        self,
+        mm: Any,
+        tokens: list[int],
+        codec_deltas: list[list[torch.Tensor]],
+        finished_flags: list[list[bool]],
+        engine_tokens: list[list[int]],
+        num_reqs: int,
+    ) -> bool:
+        """Light per-step collect for the known local-batch output shape
+        (codes.audio = per-req delta list, meta.finished = per-req bool list).
+        Returns False on shape surprises so the caller falls back to the
+        generic walk."""
+        try:
+            codes = mm.get("codes", {}) if isinstance(mm, Mapping) else None
+            meta = mm.get("meta", {}) if isinstance(mm, Mapping) else None
+            audio = codes.get("audio") if isinstance(codes, Mapping) else None
+            fin = meta.get("finished") if isinstance(meta, Mapping) else None
+            if not (
+                isinstance(audio, (list, tuple))
+                and isinstance(fin, (list, tuple))
+                and len(audio) >= num_reqs
+                and len(fin) >= num_reqs
+            ):
+                return False
+            for i in range(num_reqs):
+                codec_deltas[i].append(audio[i])
+                finished_flags[i].append(bool(fin[i]))
+                engine_tokens[i].append(tokens[i])
+            return True
+        except Exception:
+            return False
+
     def _talker_local_decode_loop(
         self,
         scheduler_output: SchedulerOutput,
@@ -903,7 +1124,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # E3 timing: measure per-step host cost breakdown (config-gated, off default)
         _e3 = os.environ.get("OMNI_TALKER_E3", "0") == "1" or getattr(self, "_talker_e3", False)
         _e3_t0 = time.perf_counter()
-        _e3_acc = {"feedback": 0.0, "metadata": 0.0, "cos": 0.0, "forward": 0.0, "tok": 0.0, "collect": 0.0}
+        _e3_acc = {"prebuild": 0.0, "feedback": 0.0, "metadata": 0.0, "cos": 0.0, "forward": 0.0, "tok": 0.0, "collect": 0.0}
 
         local_batch_desc: Any = None
         try:
@@ -935,6 +1156,22 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     if hasattr(self, "optimistic_seq_lens_cpu"):
                         self.optimistic_seq_lens_cpu[i] = p0 + 1
 
+                # MECHA: prebuild per-step metadata + cos table once per window
+                _mecha_steps = None
+                _mecha_cos_ok = False
+                _mecha_pos0 = int(self.positions[0]) if num_reqs == 1 else -1
+                if getattr(self, "_mecha_enabled", False) and num_reqs == 1:
+                    if self._mecha_meta:
+                        if _e3:
+                            _t = time.perf_counter()
+                        _mecha_steps = self._mecha_prebuild_metadata(
+                            num_reqs, req_ids[:num_reqs], window
+                        )
+                        if _e3:
+                            _e3_acc["prebuild"] += time.perf_counter() - _t
+                    if self._mecha_cos:
+                        _mecha_cos_ok = self._mecha_cos_prepare(window, _mecha_pos0)
+
                 for step_idx in range(window):
                     # refresh inputs: step 0 uses the scheduled row-0 embeds;
                     # steps 1..W-1 get the freshly sampled codec embed
@@ -946,22 +1183,28 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     if _e3:
                         _e3_acc["feedback"] += time.perf_counter() - _t
                         _t = time.perf_counter()
-                    local_metadata, _ = self._build_attention_metadata(
-                        num_tokens=num_reqs,
-                        num_tokens_padded=num_reqs,
-                        num_reqs=num_reqs,
-                        num_reqs_padded=num_reqs,
-                        max_query_len=1,
-                        ubatch_slices=None,
-                        logits_indices=None,
-                        use_spec_decode=False,
-                        num_scheduled_tokens={rid: 1 for rid in req_ids[:num_reqs]},
-                        num_scheduled_tokens_np=np.ones(num_reqs, dtype=np.int32),
-                    )
+                    if _mecha_steps is not None:
+                        local_metadata = _mecha_steps[step_idx]
+                    else:
+                        local_metadata, _ = self._build_attention_metadata(
+                            num_tokens=num_reqs,
+                            num_tokens_padded=num_reqs,
+                            num_reqs=num_reqs,
+                            num_reqs_padded=num_reqs,
+                            max_query_len=1,
+                            ubatch_slices=None,
+                            logits_indices=None,
+                            use_spec_decode=False,
+                            num_scheduled_tokens={rid: 1 for rid in req_ids[:num_reqs]},
+                            num_scheduled_tokens_np=np.ones(num_reqs, dtype=np.int32),
+                        )
                     if _e3:
                         _e3_acc["metadata"] += time.perf_counter() - _t
                         _t = time.perf_counter()
-                    update_cos_sin(self.positions[:num_reqs])
+                    if _mecha_cos_ok:
+                        self._mecha_cos_step(step_idx)
+                    else:
+                        update_cos_sin(self.positions[:num_reqs])
                     if _e3:
                         _e3_acc["cos"] += time.perf_counter() - _t
                         _t = time.perf_counter()
@@ -980,37 +1223,55 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                             )
                         except Exception:
                             pass
-                    with (
-                        record_function_or_nullcontext("talker_local_forward"),
-                        set_ascend_forward_context(
-                            local_metadata,
-                            self.vllm_config,
-                            num_tokens=num_reqs,
-                            num_tokens_across_dp=_local_ntadp,
-                            aclgraph_runtime_mode=(
-                                CUDAGraphMode.FULL if from_scratch else cudagraph_mode
+                    _mecha_light_this = (
+                        getattr(self, "_mecha_light", False) and step_idx < window - 1
+                    )
+                    if _mecha_light_this:
+                        self._talker_light_next = True
+                    try:
+                        with (
+                            record_function_or_nullcontext("talker_local_forward"),
+                            set_ascend_forward_context(
+                                local_metadata,
+                                self.vllm_config,
+                                num_tokens=num_reqs,
+                                num_tokens_across_dp=_local_ntadp,
+                                aclgraph_runtime_mode=(
+                                    CUDAGraphMode.FULL if from_scratch else cudagraph_mode
+                                ),
+                                batch_descriptor=local_batch_desc,
+                                num_actual_tokens=num_reqs,
+                                model_instance=self.model,
+                                max_tokens_across_pcp=0,
+                                skip_compiled=has_encoder_input,
                             ),
-                            batch_descriptor=local_batch_desc,
-                            num_actual_tokens=num_reqs,
-                            model_instance=self.model,
-                            max_tokens_across_pcp=0,
-                            skip_compiled=has_encoder_input,
-                        ),
-                    ):
-                        hidden_states = self._model_forward(
-                            num_reqs,
-                            input_ids=self.input_ids.gpu[:num_reqs],
-                            positions=self.positions[:num_reqs],
-                            intermediate_tensors=None,
-                            inputs_embeds=self.inputs_embeds.gpu[:num_reqs],
-                            **model_kwargs,
-                        )
+                        ):
+                            _fwd_out = self._model_forward(
+                                num_reqs,
+                                input_ids=self.input_ids.gpu[:num_reqs],
+                                positions=self.positions[:num_reqs],
+                                intermediate_tensors=None,
+                                inputs_embeds=self.inputs_embeds.gpu[:num_reqs],
+                                **model_kwargs,
+                            )
+                    finally:
+                        self._talker_light_next = False
                     if _e3:
                         _e3_acc["forward"] += time.perf_counter() - _t
                         _t = time.perf_counter()
-                    hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
+                    if _mecha_light_this and isinstance(_fwd_out, tuple) and len(_fwd_out) == 2:
+                        # MECHA light: (raw hidden, light mm dict) — skip the
+                        # OmniOutput wrapper + generic walk for non-final steps
+                        hidden_states, multimodal_outputs = _fwd_out
+                    else:
+                        hidden_states, multimodal_outputs = self.extract_multimodal_outputs(_fwd_out)
                     # engine token: read cached stop logits WITHOUT consuming
-                    tok = self._talker_local_engine_token(hidden_states[:num_reqs])
+                    if getattr(self, "_mecha_tok", False):
+                        tok = self._mecha_engine_tokens(
+                            num_reqs, req_ids[:num_reqs], hidden_states[:num_reqs]
+                        )
+                    else:
+                        tok = self._talker_local_engine_token(hidden_states[:num_reqs])
                     if _e3:
                         _e3_acc["tok"] += time.perf_counter() - _t
                         _t = time.perf_counter()
@@ -1026,7 +1287,17 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                             )
                         except Exception:
                             pass
-                    collect_step_outputs(multimodal_outputs, tokens_override=tok)
+                    if getattr(self, "_mecha_collect", False) and self._mecha_collect(
+                        multimodal_outputs,
+                        tok,
+                        codec_deltas,
+                        finished_flags,
+                        engine_tokens,
+                        num_reqs,
+                    ):
+                        pass
+                    else:
+                        collect_step_outputs(multimodal_outputs, tokens_override=tok)
                     if _e3:
                         _e3_acc["collect"] += time.perf_counter() - _t
                     if os.environ.get("OMNI_TALKER_DEBUG_TRACE", "0") == "1" or getattr(
@@ -1055,8 +1326,23 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             else:
                 # S == 1: step 0 already ran (the scheduled forward). Capture
                 # its deltas/flags/token, then run W-1 local extra steps.
-                tok0 = self._talker_local_engine_token(hidden_states[:num_reqs])
-                collect_step_outputs(multimodal_outputs, tokens_override=tok0)
+                if getattr(self, "_mecha_tok", False):
+                    tok0 = self._mecha_engine_tokens(
+                        num_reqs, req_ids[:num_reqs], hidden_states[:num_reqs]
+                    )
+                else:
+                    tok0 = self._talker_local_engine_token(hidden_states[:num_reqs])
+                if getattr(self, "_mecha_collect", False) and self._mecha_collect(
+                    multimodal_outputs,
+                    tok0,
+                    codec_deltas,
+                    finished_flags,
+                    engine_tokens,
+                    num_reqs,
+                ):
+                    pass
+                else:
+                    collect_step_outputs(multimodal_outputs, tokens_override=tok0)
                 if all(flags and flags[-1] for flags in finished_flags):
                     return hidden_states, multimodal_outputs, positions, engine_tokens, True
                 (_, local_batch_desc, _, _local_ntadp, _) = self._determine_batch_execution_and_padding(
@@ -1073,50 +1359,98 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 self.query_start_loc.np[num_reqs + 1 :].fill(num_reqs)
                 self.query_start_loc.copy_to_gpu()
 
+                # MECHA: prebuild per-step metadata + cos table once per window
+                _mecha_steps = None
+                _mecha_cos_ok = False
+                _mecha_pos0 = int(self.positions[0]) if num_reqs == 1 else -1
+                if getattr(self, "_mecha_enabled", False) and num_reqs == 1:
+                    if self._mecha_meta:
+                        if _e3:
+                            _t = time.perf_counter()
+                        _mecha_steps = self._mecha_prebuild_metadata(
+                            num_reqs, req_ids[:num_reqs], window
+                        )
+                        if _e3:
+                            _e3_acc["prebuild"] += time.perf_counter() - _t
+                    if self._mecha_cos:
+                        _mecha_cos_ok = self._mecha_cos_prepare(window, _mecha_pos0)
+
                 for local_step in range(1, window):
                     for i in range(num_reqs):
                         self._talker_local_step_feedback(i, local_step)
-                    local_metadata, _ = self._build_attention_metadata(
-                        num_tokens=num_reqs,
-                        num_tokens_padded=num_reqs,
-                        num_reqs=num_reqs,
-                        num_reqs_padded=num_reqs,
-                        max_query_len=1,
-                        ubatch_slices=None,
-                        logits_indices=None,
-                        use_spec_decode=False,
-                        num_scheduled_tokens={rid: 1 for rid in req_ids[:num_reqs]},
-                        num_scheduled_tokens_np=np.ones(num_reqs, dtype=np.int32),
-                    )
-                    update_cos_sin(self.positions[:num_reqs])
-                    with (
-                        record_function_or_nullcontext("talker_local_forward"),
-                        set_ascend_forward_context(
-                            local_metadata,
-                            self.vllm_config,
+                    if _mecha_steps is not None:
+                        local_metadata = _mecha_steps[local_step]
+                    else:
+                        local_metadata, _ = self._build_attention_metadata(
                             num_tokens=num_reqs,
-                            num_tokens_across_dp=_local_ntadp,
-                            aclgraph_runtime_mode=(
-                                CUDAGraphMode.FULL if from_scratch else cudagraph_mode
-                            ),
-                            batch_descriptor=local_batch_desc,
-                            num_actual_tokens=num_reqs,
-                            model_instance=self.model,
-                            max_tokens_across_pcp=0,
-                            skip_compiled=has_encoder_input,
-                        ),
-                    ):
-                        hidden_states = self._model_forward(
-                            num_reqs,
-                            input_ids=self.input_ids.gpu[:num_reqs],
-                            positions=self.positions[:num_reqs],
-                            intermediate_tensors=None,
-                            inputs_embeds=self.inputs_embeds.gpu[:num_reqs],
-                            **model_kwargs,
+                            num_tokens_padded=num_reqs,
+                            num_reqs=num_reqs,
+                            num_reqs_padded=num_reqs,
+                            max_query_len=1,
+                            ubatch_slices=None,
+                            logits_indices=None,
+                            use_spec_decode=False,
+                            num_scheduled_tokens={rid: 1 for rid in req_ids[:num_reqs]},
+                            num_scheduled_tokens_np=np.ones(num_reqs, dtype=np.int32),
                         )
-                    hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
-                    tok = self._talker_local_engine_token(hidden_states[:num_reqs])
-                    collect_step_outputs(multimodal_outputs, tokens_override=tok)
+                    if _mecha_cos_ok:
+                        self._mecha_cos_step(local_step)
+                    else:
+                        update_cos_sin(self.positions[:num_reqs])
+                    _mecha_light_this = (
+                        getattr(self, "_mecha_light", False) and local_step < window - 1
+                    )
+                    if _mecha_light_this:
+                        self._talker_light_next = True
+                    try:
+                        with (
+                            record_function_or_nullcontext("talker_local_forward"),
+                            set_ascend_forward_context(
+                                local_metadata,
+                                self.vllm_config,
+                                num_tokens=num_reqs,
+                                num_tokens_across_dp=_local_ntadp,
+                                aclgraph_runtime_mode=(
+                                    CUDAGraphMode.FULL if from_scratch else cudagraph_mode
+                                ),
+                                batch_descriptor=local_batch_desc,
+                                num_actual_tokens=num_reqs,
+                                model_instance=self.model,
+                                max_tokens_across_pcp=0,
+                                skip_compiled=has_encoder_input,
+                            ),
+                        ):
+                            _fwd_out = self._model_forward(
+                                num_reqs,
+                                input_ids=self.input_ids.gpu[:num_reqs],
+                                positions=self.positions[:num_reqs],
+                                intermediate_tensors=None,
+                                inputs_embeds=self.inputs_embeds.gpu[:num_reqs],
+                                **model_kwargs,
+                            )
+                    finally:
+                        self._talker_light_next = False
+                    if _mecha_light_this and isinstance(_fwd_out, tuple) and len(_fwd_out) == 2:
+                        hidden_states, multimodal_outputs = _fwd_out
+                    else:
+                        hidden_states, multimodal_outputs = self.extract_multimodal_outputs(_fwd_out)
+                    if getattr(self, "_mecha_tok", False):
+                        tok = self._mecha_engine_tokens(
+                            num_reqs, req_ids[:num_reqs], hidden_states[:num_reqs]
+                        )
+                    else:
+                        tok = self._talker_local_engine_token(hidden_states[:num_reqs])
+                    if getattr(self, "_mecha_collect", False) and self._mecha_collect(
+                        multimodal_outputs,
+                        tok,
+                        codec_deltas,
+                        finished_flags,
+                        engine_tokens,
+                        num_reqs,
+                    ):
+                        pass
+                    else:
+                        collect_step_outputs(multimodal_outputs, tokens_override=tok)
                     if all(flags and flags[-1] for flags in finished_flags):
                         break
         finally:

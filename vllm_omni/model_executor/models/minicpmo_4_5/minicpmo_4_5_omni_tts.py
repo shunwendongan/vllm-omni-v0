@@ -44,6 +44,12 @@ _REPETITION_WINDOW = 16
 _REPETITION_PENALTY_CHUNK_SIZE = 16
 _MIN_AUDIO_TOKENS = 64
 _MAX_AUDIO_TOKENS = 2048
+# MECHA (机制 A) light-mode flag: set by the runner's local decode loop for
+# non-final window steps. make_omni_output then returns the bare (hidden,
+# light-mm-dict) tuple instead of an OmniOutput, skipping wrapper assembly.
+# Module-global so it survives ACLGraphWrapper attribute routing.
+_MECHA_LIGHT_NEXT = False
+
 _AUDIO_TOKENS_PER_TEXT_TOKEN = 10
 # Codec-token sampling happens inside the model; vLLM sampling parameters
 # only choose the Talker's binary continue/stop row.
@@ -806,6 +812,156 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._step_constants_cache = cache
         return cache[1]
 
+    def make_omni_output_light(
+        self,
+        hidden: torch.Tensor,
+        infos: list[dict],
+        spans,
+        sample_eligible,
+        **kwargs: Any,
+    ) -> dict:
+        """MECHA (机制 A) point (d): sampling tail + stop row, no wrappers.
+
+        Runs the identical per-request codec sampling tail / state update /
+        _batch_stop_logits assembly as make_omni_output, but returns the bare
+        (codec_deltas, terminal_flags, stop_flags, emit_duplex_metadata)
+        tuple-ish dict instead of an OmniOutput — the runner-local loop only
+        needs codes/meta/finished and skips building lists of per-request
+        duplex tensors / dict wrappers for steps 0..W-2. The final step of a
+        window still calls the full make_omni_output so the model's cached
+        output (and _omni_last_model_output) is a complete OmniOutput.
+
+        Must stay bit-identical to make_omni_output for the sampled codec
+        sequence: it delegates to the same _sample_audio_codes and the same
+        per-row state machinery. Divergence from the full path would show up
+        in the 60-step dump compare.
+        """
+        if len(infos) != len(spans) or len(sample_eligible) != len(infos):
+            raise RuntimeError("MiniCPM-o continuous Talker light requires aligned spans/flags")
+        emit_duplex_metadata = any(isinstance(info, dict) and info.get("native_duplex") is True for info in infos)
+        row_continue, row_stop, flag_false, flag_true, empty_delta = self._step_constants(hidden)
+        stop_flags = [False] * len(infos)
+        codec_deltas: list[torch.Tensor] = [empty_delta for _ in infos]
+        terminal_flags: list[torch.Tensor] = [flag_false for _ in infos]
+        pending_samples: list[Any] = []
+        request_states = getattr(self, "_request_audio_states", None)
+        if request_states is None:
+            request_states = {}
+            self._request_audio_states = request_states
+        for index, info in enumerate(infos):
+            if not isinstance(info, dict):
+                continue
+            start, end = spans[index]
+            end = min(int(end), int(hidden.shape[0]))
+            if int(start) >= end:
+                continue
+            request_id = str(info.get("request_id", index))
+            state = request_states.get(request_id)
+            if not isinstance(state, dict):
+                state = dict(info.get("audio_state", {}) or {})
+                request_states[request_id] = state
+            if state.get("finished"):
+                stop_flags[index] = True
+                continue
+            if not sample_eligible[index]:
+                continue
+            codes = state.get("codes")
+            if not isinstance(codes, torch.Tensor):
+                codes = (info.get("audio_codes", {}) or {}).get("accumulated")
+            if not isinstance(codes, torch.Tensor):
+                codes = torch.empty(0, dtype=torch.long, device=hidden.device)
+            else:
+                codes = codes.to(device=hidden.device, dtype=torch.long).reshape(-1)
+            step = int(state.get("step", 0))
+            pending_samples.append(
+                _PendingCodecSample(
+                    output_index=index,
+                    hidden_row=hidden[end - 1 : end],
+                    codes=codes,
+                    request_id=request_id,
+                    step=step,
+                    state=state,
+                    info=info,
+                )
+            )
+        if pending_samples:
+            active_hidden_rows = [pending.hidden_row for pending in pending_samples]
+            active_hidden = (
+                active_hidden_rows[0] if len(active_hidden_rows) == 1 else torch.cat(active_hidden_rows, dim=0)
+            )
+            sampled_batch = self._sample_audio_codes(
+                active_hidden,
+                [pending.codes for pending in pending_samples],
+                [pending.request_id for pending in pending_samples],
+                [pending.step for pending in pending_samples],
+            )
+            sampled_ids = sampled_batch.detach().to(device="cpu").tolist()
+        else:
+            sampled_batch = hidden.new_empty((0,), dtype=torch.long)
+            sampled_ids = []
+        for row, pending in enumerate(pending_samples):
+            sampled = sampled_batch[row].reshape(())
+            codes = pending.codes
+            state = pending.state
+            info = pending.info
+            _min_tts = int(state.get("min_tokens", self._codec_min_tokens))
+            _step = int(state.get("step", 0))
+            if _step >= _min_tts:
+                sampled_id = int(sampled_ids[row])
+                is_eos = sampled_id == self._num_audio_tokens - 1
+            else:
+                sampled_id = None
+                is_eos = False
+            state["step"] = int(state.get("step", 0)) + 1
+            reached_limit = int(state["step"]) >= int(state.get("max_tokens", 2048))
+            finished = is_eos or reached_limit
+            state["finished"] = finished
+            if not is_eos and not reached_limit:
+                if codes.numel() >= _REPETITION_WINDOW:
+                    evicted = codes[
+                        (codes.numel() - _REPETITION_WINDOW) : (codes.numel() - _REPETITION_WINDOW + 1)
+                    ]
+                else:
+                    evicted = None
+                codes = torch.cat([codes[-(_REPETITION_WINDOW - 1) :], sampled.reshape(1)])
+                freq = state.get("freq")
+                if isinstance(freq, torch.Tensor):
+                    if evicted is not None:
+                        freq.index_add_(0, evicted, freq.new_full((evicted.shape[0],), -1.0))
+                    freq.index_add_(0, sampled.reshape(1), freq.new_ones(1))
+                delta = sampled.reshape(1, 1)
+            else:
+                delta = empty_delta
+            state["codes"] = codes
+            info["audio_state"] = state
+            info["audio_codes"] = {
+                "current": sampled.reshape(1),
+                "accumulated": codes,
+            }
+            codec_deltas[pending.output_index] = delta
+            terminal_flags[pending.output_index] = flag_true if finished else flag_false
+            stop_flags[pending.output_index] = finished
+        if stop_flags:
+            base = self._stop_logits_base_cache.get((hidden.device, hidden.dtype))
+            if base is None:
+                base = torch.tensor(
+                    [[float("-inf"), 0.0], [0.0, float("-inf")]],
+                    device=hidden.device,
+                    dtype=hidden.dtype,
+                )
+                self._stop_logits_base_cache[(hidden.device, hidden.dtype)] = base
+            idx = [0 if finished else 1 for finished in stop_flags]
+            self._batch_stop_logits = base.index_select(
+                0, base.new_tensor(idx, dtype=torch.long)
+            )
+        else:
+            self._batch_stop_logits = hidden.new_empty((0, 2))
+        return {
+            "codes": {"audio": codec_deltas},
+            "meta": {"finished": terminal_flags},
+            "_emit_duplex": emit_duplex_metadata,
+        }
+
     def make_omni_output(
         self,
         model_outputs: torch.Tensor | OmniOutput,
@@ -826,6 +982,20 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 f"MiniCPM-o continuous Talker received {len(sample_eligible)} sampling flags for {len(infos)} requests"
             )
         emit_duplex_metadata = any(isinstance(info, dict) and info.get("native_duplex") is True for info in infos)
+        if _MECHA_LIGHT_NEXT and not emit_duplex_metadata:
+            # MECHA light: identical sampling tail, no wrapper objects. The
+            # runner expects (raw_hidden, light_mm_dict). Duplex requests stay
+            # on the full path (their metadata tensors are not synthesized).
+            return (
+                hidden,
+                self.make_omni_output_light(
+                    hidden,
+                    infos,
+                    spans,
+                    sample_eligible,
+                    **kwargs,
+                ),
+            )
 
         # Rows default to continue. Only previously finished or newly terminal
         # requests stop; prefill/ineligible rows stay aligned as False.
