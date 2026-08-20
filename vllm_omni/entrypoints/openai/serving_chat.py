@@ -2626,7 +2626,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # back to the no-audio error response instead of an AttributeError 500
         # when the pipeline produced no audio for this request.
         mm_output = getattr(final_res.outputs[0], "multimodal_output", None) or {}
+        # Stage-2 (Code2Wav) wire payloads use the "model_outputs" key;
+        # other backends (serving_speech / serving_audio_generate /
+        # realtime_connection) all fall back to it. Without this, chat
+        # completions never surfaced generated audio.
         audio_data = mm_output.get("audio")
+        if audio_data is None:
+            audio_data = mm_output.get("model_outputs")
         if isinstance(audio_data, list):
             if not audio_data:
                 audio_tensor = None
