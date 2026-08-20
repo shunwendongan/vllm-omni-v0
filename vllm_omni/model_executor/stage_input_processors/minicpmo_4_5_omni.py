@@ -131,7 +131,7 @@ def _codec_config(transfer_manager: Any) -> tuple[int, int, int]:
     config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
     config = config if isinstance(config, dict) else {}
     chunk_frames = int(config.get("codec_chunk_frames", 25))
-    initial_chunk_frames = int(config.get("initial_codec_chunk_frames") or 0)
+    initial_chunk_frames = int(config.get("initial_codec_chunk_frames") or 3)
     left_context_frames = int(config.get("codec_left_context_frames", 3))
     if chunk_frames <= 0 or initial_chunk_frames < 0 or left_context_frames < 0:
         raise ValueError(

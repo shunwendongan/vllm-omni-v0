@@ -937,6 +937,36 @@ def merge_pipeline_deploy(
         )
         if ps.execution_type == StageExecutionType.LLM_AR:
             engine_args["async_scheduling"] = sched_cls is OmniARAsyncScheduler
+            # V4 defaults (official deploy config omits these): force
+            # FULL_DECODE_ONLY cudagraph + capture buckets for AR stages so
+            # the runner-local decode and static-kernel optimizations engage
+            # under the official config. User-provided values still win.
+            _cc = engine_args.get("compilation_config")
+            if not isinstance(_cc, dict):
+                _cc = {}
+                engine_args["compilation_config"] = _cc
+            _cc.setdefault("cudagraph_mode", "FULL_DECODE_ONLY")
+            _cc.setdefault("cudagraph_capture_sizes", [8, 16, 32, 64] if ps.stage_id == 0 else [1, 2, 4, 8])
+            _addl = engine_args.setdefault("additional_config", {})
+            _asc = _addl.setdefault("ascend_compilation_config", {})
+            _asc.setdefault("enable_static_kernel", True)
+            # V4 default: ngram speculative K=7 on the thinker (stage 0) when
+            # the official config omits speculative_config entirely.
+            if ps.stage_id == 0 and not engine_args.get("speculative_config"):
+                engine_args["speculative_config"] = {
+                    "method": "ngram",
+                    "num_speculative_tokens": 10,
+                    "prompt_lookup_max": 5,
+                    "prompt_lookup_min": 1,
+                }
+        elif ps.execution_type == StageExecutionType.LLM_GENERATION:
+            # V4 defaults for the generation (Code2Wav) stage: NPU graph
+            # acceleration on by default when the official config omits it.
+            _addl = engine_args.setdefault("additional_config", {})
+            _addl.setdefault("code2wav_enable_npu_graph", True)
+            _addl.setdefault("enable_hift_npu_graph", True)
+            _addl.setdefault("code2wav_max_npu_graphs", 32)
+            _addl.setdefault("hift_npu_graph_max_graphs", 8)
         extras = _build_extras(ps, ds)
         runtime: dict[str, Any] = {"process": True}
         if ds is not None:

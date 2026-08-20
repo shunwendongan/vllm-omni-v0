@@ -510,9 +510,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         overrides. All knobs are runner-side only; K=1 (default) disables the
         feature entirely and the code paths below are inert.
         """
-        self._talker_local_steps = 1
-        self._talker_local_stage_id: int | None = None
-        self._talker_cpu_slot_mapping = False
+        self._talker_local_steps = 8
+        self._talker_local_stage_id: int | None = 1
+        self._talker_cpu_slot_mapping = True
         self._talker_binary_argmax = True
         self._talker_debug_trace = False
         self._talker_dump_dir: str | None = None
@@ -597,7 +597,11 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self._mecha_tok = _mecha_master and os.environ.get(
             "OMNI_TALKER_MECHA_TOK", "1"
         ).strip().lower() not in ("0", "false", "no", "off")
-        self._mecha_collect = _mecha_master and os.environ.get(
+        # NOTE: flag kept off the method name — ``_mecha_collect`` is a method
+        # below; assigning a bool to the same name shadowed it and crashed the
+        # call sites with TypeError: 'bool' object is not callable (old-machine
+        # port fix, verified AST + runtime).
+        self._mecha_collect_enabled = _mecha_master and os.environ.get(
             "OMNI_TALKER_MECHA_COLLECT", "1"
         ).strip().lower() not in ("0", "false", "no", "off")
         self._mecha_light = _mecha_master and os.environ.get(
@@ -610,7 +614,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 self._mecha_meta,
                 self._mecha_cos,
                 self._mecha_tok,
-                self._mecha_collect,
+                self._mecha_collect_enabled,
                 self._mecha_light,
             )
 
@@ -651,7 +655,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         def _rej(why):
             if _tr:
                 logger.info('[TALKER-LOCAL] eligible REJECT: %s (K=%d stage=%s/%s async=%s mode=%s reqs=%d sched=%s spec=%s enc=%s gram=%s)',
-                            why, self._talker_local_steps, self._stage_id, self._talker_local_stage_id,
+                            why, self._talker_local_steps, getattr(self, "_stage_id", None), self._talker_local_stage_id,
                             self.use_async_scheduling, cudagraph_mode, num_reqs,
                             list(num_scheduled_tokens_np[:num_reqs]) if num_scheduled_tokens_np is not None else None,
                             use_spec_decode, has_encoder_input or num_encoder_reqs > 0,
@@ -659,7 +663,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return False
         if self._talker_local_steps <= 1:
             return _rej('K<=1')
-        if self._talker_local_stage_id is not None and self._stage_id != self._talker_local_stage_id:
+        if self._talker_local_stage_id is not None and getattr(self, "_stage_id", None) != self._talker_local_stage_id:
             return _rej('stage-mismatch')
         if self.use_async_scheduling:
             return _rej('async')
@@ -1287,7 +1291,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                             )
                         except Exception:
                             pass
-                    if getattr(self, "_mecha_collect", False) and self._mecha_collect(
+                    if getattr(self, "_mecha_collect_enabled", False) and self._mecha_collect(
                         multimodal_outputs,
                         tok,
                         codec_deltas,
@@ -1332,7 +1336,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     )
                 else:
                     tok0 = self._talker_local_engine_token(hidden_states[:num_reqs])
-                if getattr(self, "_mecha_collect", False) and self._mecha_collect(
+                if getattr(self, "_mecha_collect_enabled", False) and self._mecha_collect(
                     multimodal_outputs,
                     tok0,
                     codec_deltas,
@@ -1440,7 +1444,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         )
                     else:
                         tok = self._talker_local_engine_token(hidden_states[:num_reqs])
-                    if getattr(self, "_mecha_collect", False) and self._mecha_collect(
+                    if getattr(self, "_mecha_collect_enabled", False) and self._mecha_collect(
                         multimodal_outputs,
                         tok,
                         codec_deltas,

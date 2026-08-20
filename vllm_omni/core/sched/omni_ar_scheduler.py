@@ -239,7 +239,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # R5 runner-local Talker decode: engine must schedule exactly K tokens
         # per step for the talker stage so the runner can decompose them into
         # K sequential 1-token forwards. Knob from deploy connector extra.
-        sched_k = 0
+        sched_k = 8
         try:
             _mc = getattr(self.vllm_config, "model_config", None)
             _cc = getattr(_mc, "stage_connector_config", None)
@@ -268,7 +268,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     _e2 = _cc2.get("extra", _cc2)
                 else:
                     _e2 = getattr(_cc2, "extra", None)
-                want_stage = None
+                want_stage = "1"
                 if isinstance(_e2, dict):
                     _sv = _e2.get("talker_local_decode_stage_id")
                     if _sv is not None:

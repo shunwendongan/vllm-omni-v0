@@ -783,7 +783,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         token2wav_path = model_root / "assets" / "token2wav"
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
-        use_float16 = bool(extra.get("token2wav_float16", False))
+        use_float16 = bool(extra.get("token2wav_float16", True))
         previous_dtype = torch.get_default_dtype()
         try:
             # vLLM constructs bf16 models under a bf16 default-dtype context.
@@ -793,7 +793,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             token2wav = Token2wav(
                 str(token2wav_path),
                 float16=use_float16,
-                n_timesteps=int(extra.get("token2wav_n_timesteps", 10)),
+                n_timesteps=int(extra.get("token2wav_n_timesteps", 2)),
             )
         finally:
             torch.set_default_dtype(previous_dtype)
@@ -814,7 +814,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         so no real request state is touched.
         """
         extra = self._extra_config()
-        if not extra.get("enable_hift_warmup", False):
+        if not extra.get("enable_hift_warmup", True):
             return
         backend = getattr(self, "backend", None)
         if backend is None:
@@ -908,7 +908,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         the one-time 30-70ms prompt conditioning. Gated by the same
         ``enable_hift_warmup`` flag; failure is non-fatal."""
         extra = self._extra_config()
-        if not extra.get("enable_hift_warmup", False):
+        if not extra.get("enable_hift_warmup", True):
             return
         backend = getattr(self, "backend", None)
         if backend is None:
@@ -936,7 +936,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         real request does not pay compile latency in its mean. Gated by the
         same ``enable_hift_warmup`` flag; failure is non-fatal."""
         extra = self._extra_config()
-        if not extra.get("enable_hift_warmup", False):
+        if not extra.get("enable_hift_warmup", True):
             return
         backend = getattr(self, "backend", None)
         if backend is None:
