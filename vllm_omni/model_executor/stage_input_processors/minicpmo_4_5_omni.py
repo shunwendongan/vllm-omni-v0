@@ -30,6 +30,9 @@ _MINICPMO45_MIN_STREAM_BODY_FRAMES = 5
 _MINICPMO45_EARLY_SETUP_KEY = "code2wav_early_setup"
 _MINICPMO45_EARLY_SETUP_ENV = "VLLM_OMNI_MINICPMO45_EARLY_CODE2WAV_SETUP"
 _MINICPMO45_TENSOR_HANDOFF_ENV = "VLLM_OMNI_MINICPMO45_TENSOR_HANDOFF"
+_MINICPMO45_INITIAL_CHUNK_KEY = "initial_codec_chunk_frames"
+_MINICPMO45_INITIAL_CHUNK_ENV = "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"
+_MINICPMO45_DEFAULT_INITIAL_CHUNK_FRAMES = 25
 
 
 class _MiniCPMO45MetaStruct(MetaStruct):
@@ -133,20 +136,42 @@ def _coerce_int(value):
         return None
 
 
-def _codec_config(transfer_manager: Any) -> tuple[int, int]:
+def _codec_config(transfer_manager: Any) -> tuple[int, int, int]:
     connector = getattr(transfer_manager, "connector", None)
     raw_config = getattr(connector, "config", {}) or {}
     config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
     config = config if isinstance(config, dict) else {}
     chunk_frames = int(config.get("codec_chunk_frames", 25))
     left_context_frames = int(config.get("codec_left_context_frames", 3))
-    if chunk_frames <= 0 or left_context_frames < 0:
+    if _MINICPMO45_INITIAL_CHUNK_KEY in config:
+        raw_initial = config[_MINICPMO45_INITIAL_CHUNK_KEY]
+        initial_source = _MINICPMO45_INITIAL_CHUNK_KEY
+    else:
+        raw_initial = os.environ.get(_MINICPMO45_INITIAL_CHUNK_ENV)
+        if raw_initial is None:
+            raw_initial = _MINICPMO45_DEFAULT_INITIAL_CHUNK_FRAMES
+        initial_source = _MINICPMO45_INITIAL_CHUNK_ENV
+    try:
+        if isinstance(raw_initial, bool):
+            raise TypeError
+        initial_chunk_frames = int(raw_initial)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid {initial_source}={raw_initial!r}; expected an integer frame count"
+        ) from exc
+    if _MINICPMO45_INITIAL_CHUNK_KEY not in config:
+        if initial_chunk_frames == 0:
+            # Environment-only rollback. An explicit connector value of zero
+            # remains invalid so deployment mistakes fail visibly.
+            initial_chunk_frames = chunk_frames
+    if chunk_frames <= 0 or left_context_frames < 0 or initial_chunk_frames <= 0:
         raise ValueError(
             "Invalid MiniCPM-o codec chunk config: "
             f"codec_chunk_frames={chunk_frames}, "
+            f"initial_codec_chunk_frames={initial_chunk_frames}, "
             f"codec_left_context_frames={left_context_frames}"
         )
-    return chunk_frames, left_context_frames
+    return chunk_frames, left_context_frames, min(initial_chunk_frames, chunk_frames)
 
 
 def _config_bool(value: Any, default: bool) -> bool:
@@ -406,10 +431,11 @@ def tts2code2wav_async_chunk(
         state["segment_text_recorded"] = True
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
-    chunk_frames, left_context_frames = _codec_config(transfer_manager)
+    chunk_frames, left_context_frames, initial_chunk_frames = _codec_config(transfer_manager)
+    effective_chunk_frames = initial_chunk_frames if int(state["codec_end"]) == 0 else chunk_frames
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
-    if not flush_pending and len(pending) < chunk_frames:
+    if not flush_pending and len(pending) < effective_chunk_frames:
         if (
             codec_delta
             and not native_duplex
@@ -431,7 +457,7 @@ def tts2code2wav_async_chunk(
     hold_short_unit = (
         native_duplex and flush_pending and not last_chunk and 0 < len(pending) < _MINICPMO45_MIN_STREAM_BODY_FRAMES
     )
-    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else chunk_frames)
+    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else effective_chunk_frames)
     new_codes = pending[:new_token_count]
     del pending[:new_token_count]
     codec_start = int(state["codec_end"])
@@ -525,7 +551,7 @@ def tts2code2wav_full_payload(
     internal_id = getattr(request, "request_id", None)
     request_id = str(external_id if external_id is not None else internal_id)
     codes = _extract_codec_delta(pooling_output, request_id)
-    _, left_context_frames = _codec_config(transfer_manager)
+    _, left_context_frames, _ = _codec_config(transfer_manager)
     context = [_MINICPMO45_SILENCE_CODE] * left_context_frames if codes else []
     output_codes = [*context, *codes]
 
