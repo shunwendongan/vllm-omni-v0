@@ -12,6 +12,9 @@ from vllm.inputs import TextPrompt
 
 from vllm_omni.benchmarks.ultra_timeline import emit_ultra_timeline_event
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
+from vllm_omni.engine.tensor_envelope import (
+    build_inline_tensor_envelope,
+)
 from vllm_omni.experimental.fullduplex.engine.intermediate import (
     build_duplex_intermediate_buffer,
     set_ref_audio,
@@ -26,6 +29,7 @@ _MINICPMO45_SILENCE_CODE = 4218
 _MINICPMO45_MIN_STREAM_BODY_FRAMES = 5
 _MINICPMO45_EARLY_SETUP_KEY = "code2wav_early_setup"
 _MINICPMO45_EARLY_SETUP_ENV = "VLLM_OMNI_MINICPMO45_EARLY_CODE2WAV_SETUP"
+_MINICPMO45_TENSOR_HANDOFF_ENV = "VLLM_OMNI_MINICPMO45_TENSOR_HANDOFF"
 
 
 class _MiniCPMO45MetaStruct(MetaStruct):
@@ -161,6 +165,21 @@ def _early_setup_enabled(transfer_manager: Any) -> bool:
     if _MINICPMO45_EARLY_SETUP_KEY in config:
         return _config_bool(config[_MINICPMO45_EARLY_SETUP_KEY], True)
     return _config_bool(os.environ.get(_MINICPMO45_EARLY_SETUP_ENV), True)
+
+
+def _tensor_handoff_enabled() -> bool:
+    raw_value = os.environ.get(_MINICPMO45_TENSOR_HANDOFF_ENV)
+    if raw_value is None:
+        return True
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"Invalid {_MINICPMO45_TENSOR_HANDOFF_ENV}={raw_value!r}; "
+        "expected one of 1/0, true/false, yes/no, or on/off"
+    )
 
 
 def _request_reference_audio(request: Any) -> tuple[torch.Tensor | None, int | None]:
@@ -794,6 +813,7 @@ def llm2tts(
 
     llm_outputs = source_outputs
     tts_inputs = []
+    tensor_handoff_enabled = _tensor_handoff_enabled()
 
     if not isinstance(prompt, list):
         prompt = [prompt]
@@ -1041,15 +1061,44 @@ def llm2tts(
             )
         if ref_audio is not None:
             ref_waveform, ref_sr = ref_audio
-            set_ref_audio(model_intermediate_buffer, _to_transport_list(ref_waveform), ref_sr)
-        handoff_hidden = _to_transport_list(tts_hidden_slice) if tts_hidden_slice is not None else None
+            ref_payload = (
+                ref_waveform.detach().to(device="cpu", dtype=torch.float32).contiguous()
+                if tensor_handoff_enabled
+                else _to_transport_list(ref_waveform)
+            )
+            set_ref_audio(model_intermediate_buffer, ref_payload, ref_sr)
+        hidden_envelope = None
+        if tts_hidden_slice is None:
+            handoff_hidden = None
+        elif tensor_handoff_enabled:
+            # The orchestrator currently receives Thinker outputs on host.
+            # Preserve a contiguous tensor through EngineCore serialization,
+            # avoiding the much larger nested Python list representation.
+            handoff_hidden = tts_hidden_slice.detach().to(device="cpu", dtype=torch.float32).contiguous()
+            duplex_info = model_intermediate_buffer.get("duplex")
+            duplex_info = duplex_info if isinstance(duplex_info, Mapping) else {}
+            hidden_envelope = build_inline_tensor_envelope(
+                handoff_hidden,
+                request_id=str(llm_output.request_id),
+                payload_path="hidden_states.tts",
+                session_id=duplex_info.get("session_id") if isinstance(duplex_info.get("session_id"), str) else None,
+                epoch=duplex_info.get("epoch") if isinstance(duplex_info.get("epoch"), int) else None,
+                chunk_id=duplex_info.get("turn_id") if isinstance(duplex_info.get("turn_id"), int) else 0,
+            )
+        else:
+            handoff_hidden = _to_transport_list(tts_hidden_slice)
         native_turn_end_handoff = False
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
             native_turn_end_handoff = turn_eos_id is not None and handoff_ids is not None and turn_eos_id in handoff_ids
             if not handoff_ids:
                 continue
-        set_tts_handoff(model_intermediate_buffer, handoff_ids, handoff_hidden)
+        set_tts_handoff(
+            model_intermediate_buffer,
+            handoff_ids,
+            handoff_hidden,
+            hidden_envelope=hidden_envelope,
+        )
         if native_turn_end_handoff:
             model_intermediate_buffer.setdefault("meta", {})["turn_end"] = True
 

@@ -259,9 +259,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         if is_prefill or first_call:
             token_ids, hidden_states = get_tts_handoff(info_dict)
-            # Cross-process stage transport serializes CPU tensors as lists.
-            # Normalize both local tensor handoffs and transported payloads
-            # before validating/building the Talker condition.
+            # Accept the structured tensor path and the rollback-compatible
+            # legacy list path before building the Talker condition.
             if isinstance(token_ids, (list, tuple)):
                 token_ids = torch.as_tensor(token_ids, dtype=torch.long)
             if isinstance(hidden_states, (list, tuple)):
