@@ -4,13 +4,15 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from vllm_omni.benchmarks.ultra_timeline import emit_ultra_timeline_event
 
 _SILENCE_TOKEN = 4218
 
@@ -104,6 +106,36 @@ class BatchedToken2Wav(nn.Module):
             persistent=False,
         )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
+        self._timeline_request_ids: tuple[str, ...] = ()
+
+    @contextmanager
+    def timeline_context(self, request_ids: list[str]):
+        """Attach host request ids to one synchronous backend invocation."""
+        previous = self._timeline_request_ids
+        self._timeline_request_ids = tuple(str(request_id) for request_id in request_ids)
+        try:
+            yield
+        finally:
+            self._timeline_request_ids = previous
+
+    def _emit_timeline(
+        self,
+        event: str,
+        *,
+        shape: tuple[int, ...] | None = None,
+        num_bytes: int | None = None,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        for request_id in self._timeline_request_ids:
+            emit_ultra_timeline_event(
+                event,
+                request_id=request_id,
+                stage=2,
+                stream="compute",
+                shape=shape,
+                num_bytes=num_bytes,
+                details=details,
+            )
 
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)
@@ -344,12 +376,24 @@ class BatchedToken2Wav(nn.Module):
                 att_cache=None,
             )
             projected_speakers = self.flow.spk_embed_affine_layer(F.normalize(speakers, dim=1))
+            self._emit_timeline(
+                "cfm_setup_begin",
+                shape=tuple(hidden.shape),
+                num_bytes=hidden.numel() * hidden.element_size(),
+                details={"dtype": str(hidden.dtype)},
+            )
             _, estimator_cnn, estimator_att = self._decode_cfm(
                 hidden.transpose(1, 2).contiguous(),
                 projected_speakers,
                 prompt_mels.transpose(1, 2).contiguous(),
                 cnn_cache=None,
                 att_cache=None,
+            )
+            self._emit_timeline(
+                "cfm_setup_end",
+                shape=tuple(estimator_att.shape),
+                num_bytes=estimator_att.numel() * estimator_att.element_size(),
+                details={"dtype": str(estimator_att.dtype)},
             )
         flow_cache = {
             "conformer_cnn_cache": conformer_cnn,
@@ -425,12 +469,24 @@ class BatchedToken2Wav(nn.Module):
             )
             projected_speakers = self.flow.spk_embed_affine_layer(F.normalize(speakers, dim=1))
             cond = torch.zeros_like(hidden).transpose(1, 2).contiguous()
+            self._emit_timeline(
+                "cfm_begin",
+                shape=tuple(hidden.shape),
+                num_bytes=hidden.numel() * hidden.element_size(),
+                details={"dtype": str(hidden.dtype)},
+            )
             chunk_mel, estimator_cnn, estimator_att = self._decode_cfm(
                 hidden.transpose(1, 2).contiguous(),
                 projected_speakers,
                 cond,
                 cnn_cache=flow_cache["estimator_cnn_cache"],
                 att_cache=flow_cache["estimator_att_cache"],
+            )
+            self._emit_timeline(
+                "cfm_end",
+                shape=tuple(chunk_mel.shape),
+                num_bytes=chunk_mel.numel() * chunk_mel.element_size(),
+                details={"dtype": str(chunk_mel.dtype)},
             )
 
         prompt_len = int(features.mels.shape[1])
@@ -457,7 +513,19 @@ class BatchedToken2Wav(nn.Module):
         old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
         old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
         mel = torch.cat((old_mel, chunk_mel), dim=2)
+        self._emit_timeline(
+            "hift_begin",
+            shape=tuple(mel.shape),
+            num_bytes=mel.numel() * mel.element_size(),
+            details={"dtype": str(mel.dtype)},
+        )
         speech, source = self.hift(mel, old_source)
+        self._emit_timeline(
+            "hift_end",
+            shape=tuple(speech.shape),
+            num_bytes=speech.numel() * speech.element_size(),
+            details={"dtype": str(speech.dtype)},
+        )
         if old_speech.shape[-1] > 0:
             window = self.speech_window.to(device=speech.device, dtype=speech.dtype)
             speech = self._fade_in_out(speech, old_speech, window)

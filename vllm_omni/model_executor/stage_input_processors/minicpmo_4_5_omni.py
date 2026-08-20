@@ -9,6 +9,7 @@ from typing import Any
 import torch
 from vllm.inputs import TextPrompt
 
+from vllm_omni.benchmarks.ultra_timeline import emit_ultra_timeline_event
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.experimental.fullduplex.engine.intermediate import (
     build_duplex_intermediate_buffer,
@@ -240,6 +241,7 @@ def tts2code2wav_async_chunk(
             "internal_id": internal_id,
             "cache_epoch": 0,
             "chunk_seq": 0,
+            "first_codec_token_recorded": False,
             "retired_internal_ids": set(),
             "last_terminal_turn": None,
         }
@@ -251,6 +253,7 @@ def tts2code2wav_async_chunk(
         record["internal_id"] = internal_id
         record["cache_epoch"] = int(record["cache_epoch"]) + 1
         record["chunk_seq"] = 0
+        record["first_codec_token_recorded"] = False
         record["last_terminal_turn"] = None
         _drop_codec_state(transfer_manager, request_id)
 
@@ -275,7 +278,21 @@ def tts2code2wav_async_chunk(
         container[_MINICPMO45_ASYNC_STATE] = state
 
     pending = state["pending"]
-    pending.extend(_extract_codec_delta(multimodal_output, request_id))
+    codec_delta = _extract_codec_delta(multimodal_output, request_id)
+    if codec_delta and not bool(record.get("first_codec_token_recorded", False)):
+        emit_ultra_timeline_event(
+            "first_codec_token",
+            request_id=request_id,
+            turn_id=duplex_turn_id,
+            stage=1,
+            chunk_id=int(record["chunk_seq"]),
+            stream="codec",
+            shape=(len(codec_delta),),
+            num_bytes=len(codec_delta) * 8,
+            details={"cache_epoch": int(record["cache_epoch"])},
+        )
+        record["first_codec_token_recorded"] = True
+    pending.extend(codec_delta)
     pending_text_utf8 = state.setdefault("pending_text_utf8", [])
     current_text_utf8 = (
         segment_text_utf8.detach().to(device="cpu", dtype=torch.uint8).reshape(-1).tolist()
@@ -381,6 +398,7 @@ def tts2code2wav_async_chunk(
         record["last_terminal_turn"] = duplex_turn_key
         record["cache_epoch"] = int(record["cache_epoch"]) + 1
         record["chunk_seq"] = 0
+        record["first_codec_token_recorded"] = False
         _drop_codec_state(transfer_manager, request_id)
     return payload
 

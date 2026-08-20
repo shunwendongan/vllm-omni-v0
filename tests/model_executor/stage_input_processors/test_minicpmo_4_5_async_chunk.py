@@ -89,6 +89,24 @@ def test_first_chunk_threshold_is_25_generated_codes(count: int, emitted: bool) 
         assert payload.meta.code_flat_numel == 28
 
 
+def test_first_codec_timeline_event_is_emitted_once_per_stream(monkeypatch) -> None:
+    events = []
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.emit_ultra_timeline_event",
+        lambda event, **metadata: events.append((event, metadata)),
+    )
+    manager = _manager()
+    request = _request("req")
+
+    assert tts2code2wav_async_chunk(manager, _delta(1), request, False) is None
+    assert tts2code2wav_async_chunk(manager, _delta(2), request, False) is None
+
+    assert [event for event, _ in events] == ["first_codec_token"]
+    assert events[0][1]["request_id"] == "req"
+    assert events[0][1]["stage"] == 1
+    assert events[0][1]["shape"] == (1,)
+
+
 def test_steady_chunk_has_three_code_overlap_and_25_new_codes() -> None:
     manager = _manager()
     request = _request("req")
