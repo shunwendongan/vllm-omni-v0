@@ -319,6 +319,13 @@ class BatchedToken2Wav(nn.Module):
 
     @staticmethod
     def _split_flow_cache(cache: dict[str, torch.Tensor], batch_size: int) -> list[dict[str, torch.Tensor]]:
+        if batch_size == 1:
+            # Every tensor in ``cache`` was produced for this one request by
+            # the current setup/decode call. Transfer tensor ownership to the
+            # request state without singleton slices, cats, or clones. A new
+            # dict keeps container ownership isolated from the local batch.
+            return [{name: value.detach() for name, value in cache.items()}]
+
         result: list[dict[str, torch.Tensor]] = []
         for row in range(batch_size):
             result.append(
@@ -345,6 +352,12 @@ class BatchedToken2Wav(nn.Module):
 
     @staticmethod
     def _stack_flow_cache(states: list[BatchedToken2WavState]) -> dict[str, torch.Tensor]:
+        if len(states) == 1:
+            # Flow/DiT treat incoming caches as read-only and return new cache
+            # tensors. Preserve their storage for the scored batch=1 path
+            # while isolating the temporary batch container.
+            return dict(states[0].flow_cache)
+
         flows = [state.flow_cache for state in states]
         conditional_cnn = [flow["estimator_cnn_cache"][:, :, 0:1] for flow in flows]
         unconditional_cnn = [flow["estimator_cnn_cache"][:, :, 1:2] for flow in flows]
@@ -509,9 +522,14 @@ class BatchedToken2Wav(nn.Module):
             },
             batch_size,
         )
-        old_mel = torch.cat([state.hift_cache["mel"] for state in states], dim=0)
-        old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
-        old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
+        if batch_size == 1:
+            old_mel = states[0].hift_cache["mel"]
+            old_source = states[0].hift_cache["source"]
+            old_speech = states[0].hift_cache["speech"]
+        else:
+            old_mel = torch.cat([state.hift_cache["mel"] for state in states], dim=0)
+            old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
+            old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
         mel = torch.cat((old_mel, chunk_mel), dim=2)
         self._emit_timeline(
             "hift_begin",
