@@ -74,16 +74,23 @@ class _PendingCodecSample:
 
 
 def _max_audio_tokens(condition_tokens: int) -> int:
-    """Bound codec generation with a conservative text-length estimate.
+    """Bound codec generation with an adaptive text-length estimate.
 
     EOS is masked for the first 50 steps, so a direct ``text_tokens * 10``
     limit can terminate short responses before EOS is eligible. The 2048
     ceiling matches the checkpoint's native generation default and keeps the
     sequence within the Talker's 4096-position context.
+
+    Adaptive multiplier (task_fc967217606f): short conditions use the
+    #6215 ratio 15 so tail words are not truncated; long conditions drop to
+    10 because the inflated budget (e.g. 133 chars -> 510) pushes the Talker
+    past its training distribution and the sampled codec degenerates into
+    repeated syllables (r5_6215_multiplier_rootcause.md).
     """
+    multiplier = 15 if condition_tokens <= 25 else 10
     return max(
         _MIN_AUDIO_TOKENS,
-        min(_MAX_AUDIO_TOKENS, condition_tokens * _AUDIO_TOKENS_PER_TEXT_TOKEN),
+        min(_MAX_AUDIO_TOKENS, condition_tokens * multiplier),
     )
 
 
