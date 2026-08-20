@@ -15,14 +15,27 @@ submission readiness.
 | Target model | `OpenBMB/MiniCPM-o-4_5` |
 | Target hardware | one Atlas A3 / Ascend 910C |
 | Target image | `quay.io/ascend/vllm-omni:v0.25.0-a3` |
-| Primary workload | Seed-TTS through `/v1/chat/completions`, concurrency `c=1/4/8` |
+| Competition rules | submission guide revision 12, checked 2026-08-21 |
+| Scored workload | Seed-TTS Chinese through `/v1/chat/completions`, concurrency `c=1`, two warmup requests |
+| Compatibility workload | current official JSON's Seed-TTS English `c=1`, 32 prompts |
+| Non-scoring guardrails | `c=4/8` success, continuity, memory, and mean/P95 regression checks |
 | Official config | `tests/dfx/perf/tests/test_minicpmo_4_5.json` |
 | Existing default pipeline | async chunking; Stage 0/1 PIECEWISE graph; Stage 2 eager; 25 codec frames with 3 left-context frames |
-| Official score inputs preserved by M0 | TTFT, `audio_ttfp`, audio RTF and existing aggregation |
+| Official score order | mean audio RTF first, mean `audio_ttfp` second, mean TTFT third |
+| Official score inputs preserved by M0 | runner-produced TTFT, `audio_ttfp`, audio RTF, and existing aggregation |
 
 Before a formal A3 run, re-check the upstream branch SHA, target image, model
 weights, test script, and current competition rules. A rules or environment
 change requires a new evidence run rather than overwriting an old one.
+
+The submission guide and the current pinned performance JSON are not identical:
+the guide specifies Chinese Seed-TTS at `c=1`, while the JSON currently contains
+English `c=1/4/8` sweeps. Formal optimization decisions therefore use Chinese
+`c=1` as the scored workload and repeat the JSON's English `c=1` cell as a
+compatibility check. The candidate source is installed with
+`pip install -e . --no-build-isolation`, but deploy config and server arguments
+come from the official baseline. A candidate-only YAML change is not evidence of
+an effective competition optimization.
 
 ## M0 hypothesis and scope
 
@@ -115,17 +128,28 @@ empty-audio `audio_ttfp` behavior, invalid WAV, and valid PCM detection.
 
 The next performance PR may be created only after M0's local checks pass. A3
 promotion requires clean service restarts, fixed inputs and the alternating
-`B-C-C-B-B-C` sequence with at least three repetitions. At `c=1`, one of
-TTFT/TTFP/RTF must improve by at least 3% while the other score inputs regress
-by no more than 1%; at `c=4/8`, mean/P95 may not regress by more than 3%.
-Success rate and streaming continuity must remain 100%, and peak memory may not
-increase by more than 5% by default.
+`B-C-C-B-B-C` sequence with at least three repetitions per arm and the official
+two-request warmup. Promotion follows the competition's lexicographic score:
+
+- Prefer a `c=1` mean audio RTF improvement of at least 2%, with TTFP and TTFT
+  regressions no larger than 1%.
+- A TTFP-focused change may advance only when the RTF confidence interval is
+  non-inferior within 0.5% and TTFP improves by at least 5%.
+- A TTFT-focused change may advance only when RTF and TTFP remain non-inferior
+  and TTFT improves by at least 3%.
+
+At `c=4/8`, mean/P95, success, continuity, and memory are regression guardrails,
+not competition score targets. Success rate, streaming continuity, and
+decodable-audio rate must remain 100%, and peak memory may not increase by more
+than 5% by default.
 
 Numerical experiments remain isolated from the integration branch until they
 also pass VideoMME, Daily-Omni, ASV, WER, Demo, and stability gates. The
-target values currently tracked for this plan are VideoMME >= 67, Daily-Omni
->= 77.5, ASV >= 0.689, and WER <= 1.56; re-validate them against current
-official rules before using them as a submission gate.
+conservative gates combine the stricter value from the submission guide and the
+current repository tests: Daily-Omni >= 78.0%, Video-MME >= 68.0%, Seed-TTS
+ASV SIM >= 0.689, and Seed-TTS WER <= 1.56%. The guide's reproduced F16
+baselines are 79.5%, 69.0%, 0.709, and 1.414%, respectively. Re-validate the
+guide revision and upstream SHA before every submission evidence run.
 
 ## Fallback and evidence hygiene
 
