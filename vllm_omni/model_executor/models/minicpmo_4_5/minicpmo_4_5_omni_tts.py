@@ -50,7 +50,7 @@ _MAX_AUDIO_TOKENS = 2048
 # Module-global so it survives ACLGraphWrapper attribute routing.
 _MECHA_LIGHT_NEXT = False
 
-_AUDIO_TOKENS_PER_TEXT_TOKEN = 10
+_AUDIO_TOKENS_PER_TEXT_TOKEN = 15
 # Codec-token sampling happens inside the model; vLLM sampling parameters
 # only choose the Talker's binary continue/stop row.
 _CODEC_SEED = 42
