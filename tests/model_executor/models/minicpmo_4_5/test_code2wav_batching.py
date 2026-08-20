@@ -536,6 +536,85 @@ def test_initial_empty_segment_marker_initializes_stream_without_audio():
     assert "duplex" in model._states
 
 
+def test_init_only_prepares_state_without_audio_or_codec_progress():
+    model, token2wav = _model()
+    init = _info("early", 0, [])
+    init["meta"].update(
+        {
+            "code_flat_numel": 0,
+            "init_only": True,
+        }
+    )
+
+    init_output = _forward(model, [init])
+
+    assert init_output.multimodal_outputs["model_outputs"][0].numel() == 0
+    assert init_output.multimodal_outputs["meta.init_only"][0].item() is True
+    assert token2wav.hift.calls == []
+    assert model._states["early"].chunk_seq == -1
+    setup_calls = list(token2wav.flow.encoder.calls)
+
+    audio_output = _forward(model, [_info("early", 0, [10, 11])])
+
+    assert audio_output.multimodal_outputs["model_outputs"][0].numel() > 0
+    assert audio_output.multimodal_outputs["meta.init_only"][0].item() is False
+    assert model._states["early"].chunk_seq == 0
+    assert token2wav.flow.encoder.calls == [*setup_calls, 1]
+
+
+def test_duplicate_init_only_is_rejected_and_cleanup_releases_state():
+    model, _ = _model()
+    init = _info("early", 0, [])
+    init["meta"].update({"code_flat_numel": 0, "init_only": True})
+    _forward(model, [init])
+
+    with pytest.raises(RuntimeError, match="duplicate_init_only"):
+        _forward(model, [init])
+
+    model.on_requests_finished(["early"])
+    assert "early" not in model._states
+
+
+def test_init_only_runtime_reference_is_released_on_abort(tmp_path, monkeypatch):
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    model, _ = _model()
+    init = _info("voice", 0, [])
+    init["codes"]["ref"] = torch.tensor([0.0, 0.25, -0.25, 0.0])
+    init["meta"].update(
+        {
+            "code_flat_numel": 0,
+            "init_only": True,
+            "ref_audio_sr": 16000,
+        }
+    )
+    init["meta"].pop("prompt_cache_id")
+
+    _forward(model, [init], request_ids=["internal-voice"])
+
+    prompt_key = model._request_prompt_keys["internal-voice"]
+    prompt_path = Path(model._runtime_prompts[prompt_key].path)
+    assert prompt_path.is_file()
+
+    model.on_requests_finished(["internal-voice"])
+
+    assert "internal-voice" not in model._states
+    assert prompt_key not in model._runtime_prompts
+    assert not prompt_path.exists()
+
+
+def test_init_only_rejects_terminal_or_nonempty_payload():
+    model, _ = _model()
+    terminal = _info("early", 0, [], last_chunk=True)
+    terminal["meta"].update({"code_flat_numel": 0, "init_only": True})
+    nonempty = _info("other", 0, [10])
+    nonempty["meta"]["init_only"] = True
+
+    with pytest.raises(RuntimeError, match="invalid_init_only_payload"):
+        _forward(model, [terminal])
+    with pytest.raises(RuntimeError, match="invalid_init_only_payload"):
+        _forward(model, [nonempty])
+
+
 def test_shared_runtime_prompt_recreates_missing_file_before_second_owner(tmp_path, monkeypatch):
     monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
     model, _ = _model()

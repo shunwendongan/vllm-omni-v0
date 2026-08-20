@@ -17,9 +17,12 @@ from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _manager():
+def _manager(*, early_setup: bool | None = False):
+    extra = {"codec_chunk_frames": 25, "codec_left_context_frames": 3}
+    if early_setup is not None:
+        extra["code2wav_early_setup"] = early_setup
     return SimpleNamespace(
-        connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 25, "codec_left_context_frames": 3}}),
+        connector=SimpleNamespace(config={"extra": extra}),
         code_prompt_token_ids=defaultdict(list),
         request_payload={},
         put_req_chunk=defaultdict(int),
@@ -105,6 +108,62 @@ def test_first_codec_timeline_event_is_emitted_once_per_stream(monkeypatch) -> N
     assert events[0][1]["request_id"] == "req"
     assert events[0][1]["stage"] == 1
     assert events[0][1]["shape"] == (1,)
+
+
+def test_first_codec_token_sends_init_without_advancing_codec_stream(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_EARLY_CODE2WAV_SETUP", raising=False)
+    manager = _manager(early_setup=None)
+    request = _request("req")
+    request.additional_information = {
+        "codes": {"ref": [0.1, -0.1]},
+        "meta": {"ref_audio_sr": 16000},
+    }
+
+    init = tts2code2wav_async_chunk(manager, _delta(0), request, False)
+    waiting = tts2code2wav_async_chunk(manager, _delta(1), request, False)
+    first_audio = tts2code2wav_async_chunk(manager, _delta(*range(2, 25)), request, False)
+
+    assert init is not None
+    assert init.meta.init_only is True
+    assert init.meta.chunk_seq == 0
+    assert init.meta.code_flat_numel == 0
+    assert init.meta.codec_chunk_frames == 0
+    assert init.meta.last_chunk is False
+    assert _codes(init) == [4218]
+    assert init.codes.ref.tolist() == pytest.approx([0.1, -0.1])
+    assert init.meta.ref_audio_sr == 16000
+    assert waiting is None
+    assert first_audio is not None
+    assert first_audio.meta.init_only is False
+    assert first_audio.meta.chunk_seq == 0
+    assert first_audio.codes.ref is None
+    assert _codes(first_audio) == [4218, 4218, 4218, *range(25)]
+
+
+def test_explicit_config_disables_early_setup_even_when_environment_enables(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_EARLY_CODE2WAV_SETUP", "1")
+
+    payload = tts2code2wav_async_chunk(
+        _manager(early_setup=False),
+        _delta(1),
+        _request("req"),
+        False,
+    )
+
+    assert payload is None
+
+
+def test_environment_can_disable_default_early_setup(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_EARLY_CODE2WAV_SETUP", "0")
+
+    payload = tts2code2wav_async_chunk(
+        _manager(early_setup=None),
+        _delta(1),
+        _request("req"),
+        False,
+    )
+
+    assert payload is None
 
 
 def test_steady_chunk_has_three_code_overlap_and_25_new_codes() -> None:
