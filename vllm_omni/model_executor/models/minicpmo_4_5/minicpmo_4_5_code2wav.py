@@ -108,6 +108,7 @@ class _WorkItem:
     tts_is_last_chunk: bool
     segment_end: bool
     turn_end: bool
+    init_only: bool
     has_payload: bool = True
 
 
@@ -378,6 +379,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 tts_is_last_chunk=False,
                 segment_end=False,
                 turn_end=False,
+                init_only=False,
                 has_payload=False,
             )
         if not request_id:
@@ -393,6 +395,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         last_chunk = bool(_scalar(meta.get("last_chunk"), False))
         tts_is_last_chunk = bool(_scalar(meta.get("tts_is_last_chunk"), False))
+        init_only = bool(_scalar(meta.get("init_only"), False))
         codes = info.get("codes")
         audio = codes.get("audio") if isinstance(codes, Mapping) else None
         tokens = _codec_tensor(audio, segment)
@@ -402,6 +405,13 @@ class MiniCPMO45Code2Wav(nn.Module):
             # explicit length is the authority, so do not decode that
             # placeholder as codec data.
             tokens = segment.new_empty(0, dtype=torch.long)
+        if init_only and (last_chunk or tokens.numel() != 0):
+            raise _batch_error(
+                "invalid_init_only_payload",
+                request_id=request_id,
+                last_chunk=last_chunk,
+                code_numel=int(tokens.numel()),
+            )
         previous = self._states.get(state_id)
         if previous is None:
             if chunk_seq != 0:
@@ -433,6 +443,13 @@ class MiniCPMO45Code2Wav(nn.Module):
                 request_id=request_id,
                 expected=previous.chunk_seq + 1,
                 actual=chunk_seq,
+            )
+        if init_only and previous is not None:
+            raise _batch_error(
+                "duplicate_init_only",
+                request_id=request_id,
+                cache_epoch=cache_epoch,
+                chunk_seq=chunk_seq,
             )
         prompt_cache_id, prompt_wav, runtime_prompt_key = self._resolve_prompt(
             state_id,
@@ -475,6 +492,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             tts_is_last_chunk=tts_is_last_chunk,
             segment_end=bool(_scalar(meta.get("segment_end"), False)),
             turn_end=bool(_scalar(meta.get("turn_end"), False)),
+            init_only=init_only,
         )
 
     @staticmethod
@@ -574,15 +592,22 @@ class MiniCPMO45Code2Wav(nn.Module):
             self._prune_unowned_runtime_prompts()
             raise _batch_error("duplicate_request_in_forward", request_ids=state_ids)
         outputs = [empty for _ in segments]
-        sentinels = [item for item in items if item.last_chunk and item.tokens.numel() == 0]
+        init_items = [item for item in items if item.init_only]
+        sentinels = [item for item in items if not item.init_only and item.last_chunk and item.tokens.numel() == 0]
         segment_markers = [
-            item for item in items if not item.last_chunk and item.tts_is_last_chunk and item.tokens.numel() == 0
+            item
+            for item in items
+            if not item.init_only and not item.last_chunk and item.tts_is_last_chunk and item.tokens.numel() == 0
         ]
         compute_items = [item for item in items if item.tokens.numel() > 0]
         invalid_empty = [
             item.request_id
             for item in items
-            if item.has_payload and not item.last_chunk and not item.tts_is_last_chunk and item.tokens.numel() == 0
+            if item.has_payload
+            and not item.init_only
+            and not item.last_chunk
+            and not item.tts_is_last_chunk
+            and item.tokens.numel() == 0
         ]
         if invalid_empty:
             self._prune_unowned_runtime_prompts()
@@ -623,7 +648,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             }
         )
         initial_marker_buckets: dict[tuple[str, str], list[_WorkItem]] = {}
-        for item in segment_markers:
+        for item in [*init_items, *segment_markers]:
             if item.previous is None:
                 initial_marker_buckets.setdefault(
                     (item.prompt_cache_id, item.prompt_wav),
@@ -657,7 +682,9 @@ class MiniCPMO45Code2Wav(nn.Module):
             for item, state in zip(bucket, states, strict=True):
                 pending[item.state_id] = _RequestState(
                     cache_epoch=item.cache_epoch,
-                    chunk_seq=item.chunk_seq,
+                    # init_only is outside the codec stream. Keep the next real
+                    # chunk at sequence zero and do not advance any codec state.
+                    chunk_seq=-1 if item.init_only else item.chunk_seq,
                     prompt_cache_id=item.prompt_cache_id,
                     prompt_wav=item.prompt_wav,
                     token2wav=state,
@@ -766,6 +793,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 "meta.tts_is_last_chunk": [torch.tensor(item.tts_is_last_chunk, dtype=torch.bool) for item in items],
                 "meta.segment_end": [torch.tensor(item.segment_end, dtype=torch.bool) for item in items],
                 "meta.turn_end": [torch.tensor(item.turn_end, dtype=torch.bool) for item in items],
+                "meta.init_only": [torch.tensor(item.init_only, dtype=torch.bool) for item in items],
             },
         )
 
