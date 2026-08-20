@@ -202,15 +202,6 @@ class BatchedToken2Wav(nn.Module):
         # of (features, batch_size); all batch rows are identical, so caching
         # the batch_size=1 split state covers any N. Evicted with evict_prompt.
         self._setup_batch_cache: dict[tuple[str, str], BatchedToken2WavState] = {}
-        # PLAN B: independent absolute noise-position counter for the CFM
-        # decoder. The upstream path derives the rand_noise offset from
-        # ``att_cache.shape[4]``; under NPU graph replay that Python value is
-        # frozen at capture, and the cache-truncation policy can make it
-        # repeat/regress, phase-locking the diffusion noise (audible as
-        # repeated spectral texture from ~chunk 3 onward on long utterances).
-        # Tracking the absolute mel position here decouples the noise phase
-        # from the cache shape.
-        self._noise_position = 0
         self._hift_graph_wrapper: HiFTNPUGraphWrapper | None = None
 
     def set_hift_graph_wrapper(self, wrapper: HiFTNPUGraphWrapper | None) -> None:
@@ -350,12 +341,8 @@ class BatchedToken2Wav(nn.Module):
         decoder = self.flow.decoder
         estimator = decoder.estimator
         batch_size = int(mu.shape[0])
-        # PLAN B: absolute position counter (never regresses, independent of
-        # att_cache shape / graph capture). ``mu`` is mel frames; each
-        # rand_noise frame is one mel frame.
-        offset = self._noise_position
+        offset = int(att_cache.shape[4]) if att_cache is not None else 0
         end = offset + int(mu.shape[2])
-        self._noise_position = end
         if end > int(decoder.rand_noise.shape[2]):
             raise RuntimeError(
                 "MiniCPMO45Code2WavBatchError "
@@ -462,14 +449,6 @@ class BatchedToken2Wav(nn.Module):
             import logging
             logging.getLogger(__name__).info(
                 '[T23-N1] setup_batch CACHE HIT key=%s bs=%d', cache_key, batch_size)
-            # PLAN B: a cached state was built at a specific prompt length;
-            # the noise counter must reflect it so later decode chunks read
-            # contiguous rand_noise. The cached state carries the mel length
-            # in its hift_cache.mel width.
-            try:
-                self._noise_position = int(cached.hift_cache["mel"].shape[2])
-            except Exception:
-                pass
             return [cached] * batch_size
         import logging
         logging.getLogger(__name__).info(
@@ -503,8 +482,6 @@ class BatchedToken2Wav(nn.Module):
         }
         split = self._split_flow_cache(flow_cache, batch_size)
         mel_channels = int(prompt_mels.shape[2])
-        # PLAN B: setup consumed rand_noise[0:prompt_len); decode continues.
-        self._noise_position = max(self._noise_position, int(prompt_mels.shape[2]))
         states = [
             BatchedToken2WavState(
                 flow_cache=row,
