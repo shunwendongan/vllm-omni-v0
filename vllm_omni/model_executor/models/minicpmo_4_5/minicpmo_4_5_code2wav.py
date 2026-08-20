@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -19,6 +20,10 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
+from vllm_omni.benchmarks.ultra_timeline import (
+    emit_ultra_timeline_event,
+    ultra_timeline_enabled,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .batched_token2wav import (
@@ -129,6 +134,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         self.model_path = str(vllm_config.model_config.model)
         self.backend: BatchedToken2Wav | None = None
         self._states: dict[str, _RequestState] = {}
+        self._ultra_timeline_enabled = ultra_timeline_enabled()
+        self._timeline_pcm_seen: set[tuple[str, int]] = set()
         self._runtime_prompts: dict[str, _RuntimePrompt] = {}
         self._request_prompt_keys: dict[str, str] = {}
         self._runtime_prompt_dir = tempfile.TemporaryDirectory(
@@ -183,6 +190,12 @@ class MiniCPMO45Code2Wav(nn.Module):
         else:
             extra = getattr(connector, "extra", None)
         return dict(extra) if isinstance(extra, Mapping) else {}
+
+    def _backend_timeline_context(self, request_ids: list[str]):
+        if self.backend is None or not self._ultra_timeline_enabled:
+            return nullcontext()
+        factory = getattr(self.backend, "timeline_context", None)
+        return factory(request_ids) if callable(factory) else nullcontext()
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return torch.zeros((input_ids.numel(), 1), device=input_ids.device, dtype=torch.float32)
@@ -608,11 +621,12 @@ class MiniCPMO45Code2Wav(nn.Module):
                 ).append(item)
         for bucket in initial_marker_buckets.values():
             try:
-                features = self.backend.prepare_prompt(
-                    bucket[0].prompt_cache_id,
-                    bucket[0].prompt_wav,
-                )
-                states = self.backend.setup_batch(features, len(bucket))
+                with self._backend_timeline_context([item.request_id for item in bucket]):
+                    features = self.backend.prepare_prompt(
+                        bucket[0].prompt_cache_id,
+                        bucket[0].prompt_wav,
+                    )
+                    states = self.backend.setup_batch(features, len(bucket))
             except Exception as exc:
                 self._prune_unowned_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
@@ -641,21 +655,22 @@ class MiniCPMO45Code2Wav(nn.Module):
         for bucket in buckets.values():
             batch_size = len(bucket)
             try:
-                features = self.backend.prepare_prompt(
-                    bucket[0].prompt_cache_id,
-                    bucket[0].prompt_wav,
-                )
-                if bucket[0].previous is None:
-                    states = self.backend.setup_batch(features, batch_size)
-                else:
-                    states = [item.previous.token2wav for item in bucket if item.previous is not None]
-                tokens = torch.stack([item.tokens for item in bucket], dim=0)
-                audios, next_states = self.backend.decode_batch(
-                    tokens,
-                    features,
-                    states,
-                    last_chunk=bucket[0].last_chunk,
-                )
+                with self._backend_timeline_context([item.request_id for item in bucket]):
+                    features = self.backend.prepare_prompt(
+                        bucket[0].prompt_cache_id,
+                        bucket[0].prompt_wav,
+                    )
+                    if bucket[0].previous is None:
+                        states = self.backend.setup_batch(features, batch_size)
+                    else:
+                        states = [item.previous.token2wav for item in bucket if item.previous is not None]
+                    tokens = torch.stack([item.tokens for item in bucket], dim=0)
+                    audios, next_states = self.backend.decode_batch(
+                        tokens,
+                        features,
+                        states,
+                        last_chunk=bucket[0].last_chunk,
+                    )
             except Exception as exc:
                 self._prune_unowned_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
@@ -676,6 +691,38 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
             for item, audio, next_state in zip(bucket, audios, next_states, strict=True):
                 outputs[item.output_index] = audio.reshape(-1).to(dtype=torch.float32)
+                if self._ultra_timeline_enabled:
+                    timeline_key = (item.state_id, item.cache_epoch)
+                    first_pcm = timeline_key not in self._timeline_pcm_seen
+                    emit_ultra_timeline_event(
+                        "first_pcm_ready" if first_pcm else "pcm_ready",
+                        request_id=item.request_id,
+                        turn_id=item.duplex_turn_id if item.duplex_turn_id >= 0 else None,
+                        stage=2,
+                        chunk_id=item.chunk_seq,
+                        stream="audio",
+                        shape=tuple(audio.shape),
+                        num_bytes=audio.numel() * audio.element_size(),
+                        details={
+                            "cache_epoch": item.cache_epoch,
+                            "last_chunk": item.last_chunk,
+                            "dtype": str(audio.dtype),
+                        },
+                    )
+                    self._timeline_pcm_seen.add(timeline_key)
+                    if item.last_chunk:
+                        emit_ultra_timeline_event(
+                            "last_audio_ready",
+                            request_id=item.request_id,
+                            turn_id=item.duplex_turn_id if item.duplex_turn_id >= 0 else None,
+                            stage=2,
+                            chunk_id=item.chunk_seq,
+                            stream="audio",
+                            shape=tuple(audio.shape),
+                            num_bytes=audio.numel() * audio.element_size(),
+                            details={"cache_epoch": item.cache_epoch, "dtype": str(audio.dtype)},
+                        )
+                        self._timeline_pcm_seen.discard(timeline_key)
                 pending[item.state_id] = (
                     None
                     if item.last_chunk
@@ -716,6 +763,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         for request_id in finished_req_ids:
             state_id = str(request_id)
             self._states.pop(state_id, None)
+            if self._ultra_timeline_enabled:
+                self._timeline_pcm_seen = {key for key in self._timeline_pcm_seen if key[0] != state_id}
             self._release_request_prompt(state_id)
 
     def make_omni_output(self, model_outputs: Any, **_: Any) -> OmniOutput:

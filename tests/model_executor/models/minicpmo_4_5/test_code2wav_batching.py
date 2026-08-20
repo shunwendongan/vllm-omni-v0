@@ -265,6 +265,31 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     assert cache1[0, 0, 0, 0, 0].item() == 20
 
 
+def test_adapter_timeline_context_emits_cfm_and_hift_boundaries(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav.emit_ultra_timeline_event",
+        lambda event, **metadata: events.append((event, metadata)),
+    )
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+
+    with adapter.timeline_context(["request-a"]):
+        states = adapter.setup_batch(prompt, 1)
+        adapter.decode_batch(torch.tensor([[10, 11]]), prompt, states, last_chunk=False)
+
+    assert [event for event, _ in events] == [
+        "cfm_setup_begin",
+        "cfm_setup_end",
+        "cfm_begin",
+        "cfm_end",
+        "hift_begin",
+        "hift_end",
+    ]
+    assert all(metadata["request_id"] == "request-a" for _, metadata in events)
+    assert all(metadata["stage"] == 2 for _, metadata in events)
+
+
 def test_fade_in_out_limits_overlap_to_available_previous_audio():
     speech = torch.arange(6, dtype=torch.float32).reshape(1, -1)
     previous = torch.full((1, 3), 2.0)
@@ -322,6 +347,24 @@ def test_model_preserves_output_slots_and_prefers_runtime_codes():
     torch.testing.assert_close(audios[0][0], torch.tensor(1.7 * 10))
     torch.testing.assert_close(audios[1][0], torch.tensor(1.7 * 20))
     assert token2wav.flow.encoder.calls[-1] == 2
+
+
+def test_code2wav_timeline_marks_first_pcm_and_last_audio(monkeypatch):
+    events = []
+    model, _ = _model()
+    model._ultra_timeline_enabled = True
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav.emit_ultra_timeline_event",
+        lambda event, **metadata: events.append((event, metadata)),
+    )
+
+    _forward(model, [_info("a", 0, [10, 11])])
+    _forward(model, [_info("a", 1, [12, 13], last_chunk=True)])
+
+    assert [event for event, _ in events] == ["first_pcm_ready", "pcm_ready", "last_audio_ready"]
+    assert events[0][1]["chunk_id"] == 0
+    assert events[-1][1]["chunk_id"] == 1
+    assert events[-1][1]["details"]["cache_epoch"] == 0
 
 
 def test_code2wav_projects_duplex_metadata_to_final_audio_output():
