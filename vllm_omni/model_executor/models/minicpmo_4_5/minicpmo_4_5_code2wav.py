@@ -329,7 +329,17 @@ class MiniCPMO45Code2Wav(nn.Module):
                 counts=normalized,
                 total=int(flat.numel()),
             )
+        if len(normalized) == 1:
+            return [flat]
         return list(torch.split(flat, normalized))
+
+    @staticmethod
+    def _batch_codec_tokens(items: list[_WorkItem]) -> torch.Tensor:
+        if len(items) == 1:
+            # The decoder reads codec tokens without modifying them. Keep the
+            # singleton payload as a view instead of launching torch.stack.
+            return items[0].tokens.unsqueeze(0)
+        return torch.stack([item.tokens for item in items], dim=0)
 
     def _parse_item(
         self,
@@ -664,7 +674,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                         states = self.backend.setup_batch(features, batch_size)
                     else:
                         states = [item.previous.token2wav for item in bucket if item.previous is not None]
-                    tokens = torch.stack([item.tokens for item in bucket], dim=0)
+                    tokens = self._batch_codec_tokens(bucket)
                     audios, next_states = self.backend.decode_batch(
                         tokens,
                         features,

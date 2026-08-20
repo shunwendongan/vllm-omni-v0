@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
+    BatchedToken2WavState,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
@@ -327,6 +328,103 @@ def test_estimator_cache_stack_split_round_trip_preserves_cfg_rows():
             round_tripped["estimator_att_cache"],
             original.flow_cache["estimator_att_cache"],
         )
+
+
+def test_batch1_flow_cache_handoff_reuses_request_owned_storage():
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    cache = {
+        "conformer_cnn_cache": torch.randn(1, 2, 3),
+        "conformer_att_cache": torch.randn(2, 1, 3, 4),
+        "estimator_cnn_cache": torch.randn(2, 3, 2, 4, 5),
+        "estimator_att_cache": torch.randn(2, 3, 2, 4, 5, 6),
+    }
+
+    request_cache = adapter._split_flow_cache(cache, 1)[0]
+    state = BatchedToken2WavState(
+        flow_cache=request_cache,
+        hift_cache={},
+    )
+    restacked = adapter._stack_flow_cache([state])
+
+    assert request_cache is not cache
+    assert restacked is not request_cache
+    for name, original in cache.items():
+        assert request_cache[name].data_ptr() == original.data_ptr()
+        assert restacked[name].data_ptr() == original.data_ptr()
+
+
+def test_batch1_decode_preserves_previous_state_and_isolates_next_state():
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    previous = adapter.setup_batch(prompt, 1)[0]
+    flow_before = {name: value.clone() for name, value in previous.flow_cache.items()}
+    hift_before = {name: value.clone() for name, value in previous.hift_cache.items()}
+    tokens = torch.tensor([[10, 11]])
+
+    audios, next_states = adapter.decode_batch(
+        tokens,
+        prompt,
+        [previous],
+        last_chunk=False,
+    )
+    next_state = next_states[0]
+
+    for name, expected in flow_before.items():
+        torch.testing.assert_close(previous.flow_cache[name], expected)
+        assert next_state.flow_cache[name].data_ptr() != previous.flow_cache[name].data_ptr()
+    for name, expected in hift_before.items():
+        torch.testing.assert_close(previous.hift_cache[name], expected)
+    for cache in next_state.hift_cache.values():
+        assert cache.untyped_storage().data_ptr() != audios[0].untyped_storage().data_ptr()
+    torch.testing.assert_close(tokens, torch.tensor([[10, 11]]))
+
+
+def test_batch1_low_copy_matches_generic_batched_row():
+    single = BatchedToken2Wav(_FakeToken2Wav())
+    batched = BatchedToken2Wav(_FakeToken2Wav())
+    single_prompt = single.prepare_prompt("shared", "/fake/prompt.wav")
+    batched_prompt = batched.prepare_prompt("shared", "/fake/prompt.wav")
+
+    single_audio, single_states = single.decode_batch(
+        torch.tensor([[10, 11]]),
+        single_prompt,
+        single.setup_batch(single_prompt, 1),
+        last_chunk=False,
+    )
+    batched_audio, batched_states = batched.decode_batch(
+        torch.tensor([[10, 11], [20, 21]]),
+        batched_prompt,
+        batched.setup_batch(batched_prompt, 2),
+        last_chunk=False,
+    )
+
+    torch.testing.assert_close(single_audio[0], batched_audio[0])
+    for name, value in single_states[0].flow_cache.items():
+        torch.testing.assert_close(value, batched_states[0].flow_cache[name])
+    for name, value in single_states[0].hift_cache.items():
+        torch.testing.assert_close(value, batched_states[0].hift_cache[name])
+
+
+def test_singleton_segment_and_codec_batch_are_views(monkeypatch):
+    flat = torch.tensor([10, 11, 12])
+    monkeypatch.setattr(
+        torch,
+        "split",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("singleton split must be skipped")),
+    )
+    monkeypatch.setattr(
+        torch,
+        "stack",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("singleton stack must be skipped")),
+    )
+
+    segment = MiniCPMO45Code2Wav._split_segments(flat, [3])[0]
+    item = SimpleNamespace(tokens=segment)
+    batched = MiniCPMO45Code2Wav._batch_codec_tokens([item])
+
+    assert segment.data_ptr() == flat.data_ptr()
+    assert batched.data_ptr() == flat.data_ptr()
+    assert tuple(batched.shape) == (1, 3)
 
 
 def test_model_preserves_output_slots_and_prefers_runtime_codes():
