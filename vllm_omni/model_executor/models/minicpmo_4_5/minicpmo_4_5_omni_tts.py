@@ -87,10 +87,9 @@ def _max_audio_tokens(condition_tokens: int) -> int:
     past its training distribution and the sampled codec degenerates into
     repeated syllables (r5_6215_multiplier_rootcause.md).
     """
-    multiplier = 15 if condition_tokens <= 25 else 10
     return max(
         _MIN_AUDIO_TOKENS,
-        min(_MAX_AUDIO_TOKENS, condition_tokens * multiplier),
+        min(_MAX_AUDIO_TOKENS, condition_tokens * 10 + 48),
     )
 
 
