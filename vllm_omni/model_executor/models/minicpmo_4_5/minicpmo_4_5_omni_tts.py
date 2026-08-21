@@ -42,15 +42,18 @@ logger = init_logger(__name__)
 
 _REPETITION_WINDOW = 16
 _REPETITION_PENALTY_CHUNK_SIZE = 16
-_MIN_AUDIO_TOKENS = 64
-_MAX_AUDIO_TOKENS = 2048
+_MIN_AUDIO_BUDGET = 128
+_MAX_AUDIO_BUDGET = 340
+# 3-agent formula constants (task_fc967217606f follow-up):
+# natural codec length zh min100/mean147/p95 203/max293
+_AUDIO_TOKENS_PER_TEXT_TOKEN = 10
+_AUDIO_TOKEN_FIXED_OVERHEAD = 48
 # MECHA (机制 A) light-mode flag: set by the runner's local decode loop for
 # non-final window steps. make_omni_output then returns the bare (hidden,
 # light-mm-dict) tuple instead of an OmniOutput, skipping wrapper assembly.
 # Module-global so it survives ACLGraphWrapper attribute routing.
 _MECHA_LIGHT_NEXT = False
 
-_AUDIO_TOKENS_PER_TEXT_TOKEN = 15
 # Codec-token sampling happens inside the model; vLLM sampling parameters
 # only choose the Talker's binary continue/stop row.
 _CODEC_SEED = 42
@@ -81,15 +84,14 @@ def _max_audio_tokens(condition_tokens: int) -> int:
     ceiling matches the checkpoint's native generation default and keeps the
     sequence within the Talker's 4096-position context.
 
-    Adaptive multiplier (task_fc967217606f): short conditions use the
-    #6215 ratio 15 so tail words are not truncated; long conditions drop to
-    10 because the inflated budget (e.g. 133 chars -> 510) pushes the Talker
-    past its training distribution and the sampled codec degenerates into
-    repeated syllables (r5_6215_multiplier_rootcause.md).
+    3-agent formula (2026-08-21): budget = max(128, min(340, ct*10+48)).
+    Short conditions get the +48 overhead floor (no truncation of the
+    natural min-100 codec length); long conditions cap at 340 (below the
+    degradation ceiling) so the Talker stays in its training distribution.
     """
     return max(
-        _MIN_AUDIO_TOKENS,
-        min(_MAX_AUDIO_TOKENS, condition_tokens * 10 + 48),
+        _MIN_AUDIO_BUDGET,
+        min(_MAX_AUDIO_BUDGET, condition_tokens * _AUDIO_TOKENS_PER_TEXT_TOKEN + _AUDIO_TOKEN_FIXED_OVERHEAD),
     )
 
 
