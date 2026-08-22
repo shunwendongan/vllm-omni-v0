@@ -510,7 +510,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         overrides. All knobs are runner-side only; K=1 (default) disables the
         feature entirely and the code paths below are inert.
         """
-        self._talker_local_steps = 8
+        self._talker_local_steps = 1
         self._talker_local_stage_id: int | None = 1
         self._talker_cpu_slot_mapping = True
         self._talker_binary_argmax = True
