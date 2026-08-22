@@ -34,6 +34,12 @@ from .batched_token2wav import (
 
 logger = init_logger(__name__)
 
+_ALLOWED_TOKEN2WAV_N_TIMESTEPS = frozenset({6, 8, 10})
+_TRUE_CONFIG_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_CONFIG_VALUES = frozenset({"0", "false", "no", "off"})
+_CFM_STEPS_ENV = "VLLM_OMNI_MINICPMO45_CFM_STEPS"
+_FLOW_FP16_ENV = "VLLM_OMNI_MINICPMO45_FLOW_FP16"
+
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
     payload = {"reason": reason, **details}
@@ -46,6 +52,56 @@ def _scalar(value: Any, default: Any = None) -> Any:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return _scalar(value[0], default) if value else default
     return default if value is None else value
+
+
+def _parse_token2wav_n_timesteps(value: Any) -> int:
+    """Accept only the bounded CFM quality grid; reject implicit coercion."""
+    if type(value) is not int or value not in _ALLOWED_TOKEN2WAV_N_TIMESTEPS:
+        allowed = ", ".join(str(step) for step in sorted(_ALLOWED_TOKEN2WAV_N_TIMESTEPS))
+        raise ValueError(f"MiniCPM-o token2wav_n_timesteps must be an integer in {{{allowed}}}; got {value!r}")
+    return value
+
+
+def _parse_token2wav_float16(value: Any) -> bool:
+    """Parse the precision toggle without Python truthiness surprises."""
+    if isinstance(value, bool):
+        return value
+    if type(value) is int and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUE_CONFIG_VALUES:
+            return True
+        if normalized in _FALSE_CONFIG_VALUES:
+            return False
+    raise ValueError(
+        "MiniCPM-o token2wav_float16 must be a boolean, 0/1, or one of "
+        f"true/false, yes/no, on/off; got {value!r}"
+    )
+
+
+def _resolve_token2wav_n_timesteps(extra: Mapping[str, Any]) -> tuple[int, str]:
+    if "token2wav_n_timesteps" in extra:
+        return _parse_token2wav_n_timesteps(extra["token2wav_n_timesteps"]), "config"
+    raw = os.environ.get(_CFM_STEPS_ENV)
+    if raw is None:
+        return 10, "default"
+    normalized = raw.strip()
+    if normalized not in {"6", "8", "10"}:
+        raise ValueError(f"MiniCPM-o {_CFM_STEPS_ENV} must be one of 6, 8, 10; got {raw!r}")
+    return _parse_token2wav_n_timesteps(int(normalized)), "environment"
+
+
+def _resolve_token2wav_float16(extra: Mapping[str, Any]) -> tuple[bool, str]:
+    if "token2wav_float16" in extra:
+        return _parse_token2wav_float16(extra["token2wav_float16"]), "config"
+    raw = os.environ.get(_FLOW_FP16_ENV)
+    if raw is None:
+        return False, "default"
+    try:
+        return _parse_token2wav_float16(raw), "environment"
+    except ValueError as exc:
+        raise ValueError(f"MiniCPM-o {_FLOW_FP16_ENV} is invalid: {raw!r}") from exc
 
 
 def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
@@ -143,6 +199,8 @@ class MiniCPMO45Code2Wav(nn.Module):
             prefix="minicpmo45-runtime-prompts-",
         )
         extra = self._extra_config()
+        self._token2wav_n_timesteps, self._token2wav_n_timesteps_source = _resolve_token2wav_n_timesteps(extra)
+        self._token2wav_float16, self._token2wav_float16_source = _resolve_token2wav_float16(extra)
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
@@ -840,7 +898,6 @@ class MiniCPMO45Code2Wav(nn.Module):
         else:
             from stepaudio2.token2wav import Token2wav
 
-        extra = self._extra_config()
         model_root = self._resolve_model_root()
         prompt_path = Path(self._default_prompt_wav)
         if not prompt_path.is_file():
@@ -848,7 +905,20 @@ class MiniCPMO45Code2Wav(nn.Module):
         token2wav_path = model_root / "assets" / "token2wav"
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
-        use_float16 = bool(extra.get("token2wav_float16", False))
+        use_float16 = self._token2wav_float16
+        use_npu_flow_autocast = use_float16 and current_omni_platform.is_npu()
+        # NPU Flow weights stay FP32 so an unavailable autocast API can fall
+        # back safely. CUDA retains the existing half-weight behavior.
+        use_half_weights = use_float16 and not use_npu_flow_autocast
+        if self._token2wav_n_timesteps != 10 or use_float16:
+            logger.warning(
+                "MiniCPM-o numerical lab enabled: cfm_steps=%d (%s), flow_fp16=%s (%s); "
+                "full Seed-TTS ASV/WER gates are required",
+                self._token2wav_n_timesteps,
+                self._token2wav_n_timesteps_source,
+                use_float16,
+                self._token2wav_float16_source,
+            )
         previous_dtype = torch.get_default_dtype()
         try:
             # vLLM constructs bf16 models under a bf16 default-dtype context.
@@ -857,9 +927,12 @@ class MiniCPMO45Code2Wav(nn.Module):
             torch.set_default_dtype(torch.float32)
             token2wav = Token2wav(
                 str(token2wav_path),
-                float16=use_float16,
-                n_timesteps=int(extra.get("token2wav_n_timesteps", 10)),
+                float16=use_half_weights,
+                n_timesteps=self._token2wav_n_timesteps,
             )
         finally:
             torch.set_default_dtype(previous_dtype)
-        self.backend = BatchedToken2Wav(token2wav)
+        self.backend = BatchedToken2Wav(
+            token2wav,
+            npu_flow_float16=use_npu_flow_autocast,
+        )

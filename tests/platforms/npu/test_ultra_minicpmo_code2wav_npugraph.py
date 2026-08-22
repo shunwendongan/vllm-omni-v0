@@ -46,7 +46,8 @@ class _Token2Wav:
         self.speech_window = torch.ones(4, device="npu")
 
 
-def test_minicpmo_cfm_estimator_npugraph_matches_eager():
+@pytest.mark.parametrize("flow_fp16", [False, True], ids=["fp32", "flow-fp16"])
+def test_minicpmo_cfm_estimator_npugraph_matches_eager(flow_fp16):
     decoder_dit = pytest.importorskip("cosyvoice2.flow.decoder_dit")
     prepare_code2wav_graph_runtime()
 
@@ -64,7 +65,10 @@ def test_minicpmo_cfm_estimator_npugraph_matches_eager():
         .eval()
     )
     graph_runner = NPUExactGraphRunner(max_graphs=4)
-    adapter = BatchedToken2Wav(_Token2Wav(estimator))
+    adapter = BatchedToken2Wav(
+        _Token2Wav(estimator),
+        npu_flow_float16=flow_fp16,
+    )
 
     def inputs(seed: int):
         def make(shape: tuple[int, ...], offset: float):
@@ -98,7 +102,7 @@ def test_minicpmo_cfm_estimator_npugraph_matches_eager():
         warm_outputs = graph_runner.run(
             "cfm_estimator",
             warm_inputs,
-            (False,),
+            (False, "float16" if flow_fp16 else "float32"),
             lambda *values: compute(*values),
         )
         replay_inputs = inputs(13)
@@ -106,7 +110,7 @@ def test_minicpmo_cfm_estimator_npugraph_matches_eager():
         actual = graph_runner.run(
             "cfm_estimator",
             replay_inputs,
-            (False,),
+            (False, "float16" if flow_fp16 else "float32"),
             lambda *values: compute(*values),
         )
         for eager, replayed in zip(expected, actual, strict=True):
@@ -117,7 +121,7 @@ def test_minicpmo_cfm_estimator_npugraph_matches_eager():
         graph_runner.run(
             "cfm_estimator",
             cached_inputs,
-            (True,),
+            (True, "float16" if flow_fp16 else "float32"),
             lambda *values: compute(*values[:5], caches=(values[5], values[6])),
         )
         replay_cached_inputs = (
@@ -132,10 +136,12 @@ def test_minicpmo_cfm_estimator_npugraph_matches_eager():
         actual_cached = graph_runner.run(
             "cfm_estimator",
             replay_cached_inputs,
-            (True,),
+            (True, "float16" if flow_fp16 else "float32"),
             lambda *values: compute(*values[:5], caches=(values[5], values[6])),
         )
         for eager, replayed in zip(expected_cached, actual_cached, strict=True):
             assert torch.isfinite(replayed).all()
             torch.testing.assert_close(replayed, eager, rtol=1e-3, atol=1e-3)
         assert graph_runner.stats == {"captures": 2, "failed": 0, "hits": 2}
+        expected_dtype = "float16" if flow_fp16 else "float32"
+        assert adapter.precision_telemetry()["effective_dtype"] == expected_dtype
