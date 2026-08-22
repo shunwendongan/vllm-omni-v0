@@ -183,7 +183,7 @@ class StageExecutionType(str, Enum):
 
 def _resolve_scheduler(
     execution_type: StageExecutionType,
-    async_scheduling: bool = True,
+    async_scheduling: bool = False,
 ) -> type[VLLMScheduler] | None:
     """Return the scheduler class for the given execution_type.
 
@@ -933,7 +933,7 @@ def merge_pipeline_deploy(
             engine_args.setdefault("skip_mm_profiling", True)
         sched_cls = _resolve_scheduler(
             ps.execution_type,
-            engine_args.get("async_scheduling", True),
+            engine_args.get("async_scheduling", False),
         )
         if ps.execution_type == StageExecutionType.LLM_AR:
             engine_args["async_scheduling"] = sched_cls is OmniARAsyncScheduler
@@ -945,7 +945,10 @@ def merge_pipeline_deploy(
             if not isinstance(_cc, dict):
                 _cc = {}
                 engine_args["compilation_config"] = _cc
-            _cc.setdefault("cudagraph_mode", "FULL_DECODE_ONLY")
+            # Force FULL_DECODE_ONLY (not setdefault): PIECEWISE under the
+            # official baseline config is incompatible with the sync
+            # OmniARScheduler + K-token local decode (0-token schedule assert).
+            _cc["cudagraph_mode"] = "FULL_DECODE_ONLY"
             _cc.setdefault("cudagraph_capture_sizes", [8, 16, 32, 64] if ps.stage_id == 0 else [1, 2, 4, 8])
             _addl = engine_args.setdefault("additional_config", {})
             _asc = _addl.setdefault("ascend_compilation_config", {})
