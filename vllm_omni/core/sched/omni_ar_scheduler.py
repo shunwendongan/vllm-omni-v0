@@ -56,7 +56,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 _extra = _cc.get('extra', _cc)
             else:
                 _extra = getattr(_cc, 'extra', None)
-            _k = 1
+            _k = 8
             if isinstance(_extra, dict):
                 _v = _extra.get('talker_local_decode_steps')
                 if _v is not None:
