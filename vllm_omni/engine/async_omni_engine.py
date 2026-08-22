@@ -313,6 +313,8 @@ class AsyncOmniEngine:
         # Launch orchestrator background thread
         startup_future: concurrent.futures.Future = concurrent.futures.Future()
 
+        from vllm_omni.utils.cpu_isolation import isolate_host_thread
+        isolate_host_thread(group=0)
         self.orchestrator_thread = threading.Thread(
             target=self._bootstrap_orchestrator,
             args=(
@@ -341,7 +343,7 @@ class AsyncOmniEngine:
         )
 
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
-        if os.environ.get("W4_PREWARM", "0") == "1" and not getattr(self, "_w4_prewarm_fired", False):
+        if os.environ.get("W4_PREWARM", "1") == "1" and not getattr(self, "_w4_prewarm_fired", False):
             self._w4_prewarm_fired = True
             port = int(os.environ.get("W4_PREWARM_PORT", "8091"))
             threading.Thread(target=_w4_full_chain_prewarm, args=(port,), daemon=True).start()

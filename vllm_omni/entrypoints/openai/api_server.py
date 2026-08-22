@@ -1744,7 +1744,7 @@ async def health(raw_request: Request) -> JSONResponse:
 
     try:
         await engine_client.check_health()
-        _w4_env = os.environ.get("W4_PREWARM", "0")
+        _w4_env = os.environ.get("W4_PREWARM", "1")
         print(f"[W4-I03] health handler: env={_w4_env} done={_prewarm_health_state['done']}", flush=True)
         if _w4_env == "1" and not _prewarm_health_state["done"]:
             _prewarm_health_state["done"] = True
