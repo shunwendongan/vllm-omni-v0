@@ -44,6 +44,36 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # R5 runner-local Talker decode: pre-allocate K-1 lookahead KV slots
+        # so the K-token window never crosses a block boundary. allocate_slots
+        # natively multi-allocates with num_lookahead_tokens; without it the
+        # post-schedule nst bump allocates only 1 slot and the window drifts
+        # across blocks (WER 2.12% -> 1.00% at K=1). Talker stage only.
+        try:
+            _mc = self.vllm_config.model_config
+            _cc = getattr(_mc, 'stage_connector_config', None)
+            if isinstance(_cc, dict):
+                _extra = _cc.get('extra', _cc)
+            else:
+                _extra = getattr(_cc, 'extra', None)
+            _k = 1
+            if isinstance(_extra, dict):
+                _v = _extra.get('talker_local_decode_steps')
+                if _v is not None:
+                    _k = max(1, int(_v))
+            _env_k = os.environ.get('OMNI_TALKER_SCHED_K')
+            if _env_k is not None and _env_k.strip().isdigit():
+                _k = max(1, int(_env_k.strip()))
+            _sid = getattr(_mc, 'stage_id', None)
+            _want = 1
+            if isinstance(_extra, dict):
+                _sv = _extra.get('talker_local_decode_stage_id')
+                if _sv is not None:
+                    _want = int(_sv)
+            if _k > 1 and (str(_sid) == str(_want)):
+                self.num_lookahead_tokens = _k - 1
+        except Exception:
+            pass
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
