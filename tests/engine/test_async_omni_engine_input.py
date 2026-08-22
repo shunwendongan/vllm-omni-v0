@@ -137,6 +137,67 @@ def test_build_add_request_message_with_resumable_streaming(mocker: MockerFixtur
     assert input_processor.process_inputs.call_args.kwargs["resumable"] is True
 
 
+def test_build_add_request_message_emits_opt_in_stage0_preprocess_boundaries(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    engine._ultra_timeline_enabled = True
+    params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    engine.stage_pools = []
+
+    input_processor = mocker.Mock()
+    input_processor.process_inputs.return_value = _make_engine_core_request("req-timeline")
+    engine.input_processor = input_processor
+    emit = mocker.patch("vllm_omni.engine.async_omni_engine.emit_ultra_timeline_event")
+
+    engine._build_add_request_message(
+        request_id="req-timeline",
+        prompt={"prompt": "hello"},
+        sampling_params_list=[params],
+        final_stage_id=0,
+    )
+
+    event_names = [call.args[0] for call in emit.call_args_list]
+    assert event_names == [
+        "stage0_preprocess_begin",
+        "stage0_preprocess_end",
+        "stage0_queue_enter",
+    ]
+    assert emit.call_args_list[0].kwargs["details"] == {
+        "prompt_type": "dict",
+        "has_multi_modal_data": False,
+    }
+    end_details = emit.call_args_list[1].kwargs["details"]
+    assert end_details["prompt_tokens"] == 3
+    assert end_details["has_mm_features"] is False
+    assert end_details["preprocess_ms"] >= 0
+    assert "hello" not in repr(emit.call_args_list)
+
+
+def test_build_add_request_message_default_path_skips_stage0_timeline(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    engine.stage_pools = []
+
+    input_processor = mocker.Mock()
+    input_processor.process_inputs.return_value = _make_engine_core_request("req-default")
+    engine.input_processor = input_processor
+    emit = mocker.patch("vllm_omni.engine.async_omni_engine.emit_ultra_timeline_event")
+
+    engine._build_add_request_message(
+        request_id="req-default",
+        prompt={"prompt": "hello"},
+        sampling_params_list=[params],
+        final_stage_id=0,
+    )
+
+    emit.assert_not_called()
+
+
 class _FakeStageClient:
     stage_type = "llm"
     final_output = False
