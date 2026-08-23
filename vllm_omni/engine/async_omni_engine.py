@@ -35,9 +35,9 @@ def _w4_full_chain_prewarm(port: int) -> None:
             "model": "openbmb/MiniCPM-o-4_5",
             "messages": [
                 {"role": "system", "content": "你是 MiniCPM-o。请简短回答。"},
-                {"role": "user", "content": [{"type": "text", "text": "你好"}]},
+                {"role": "user", "content": [{"type": "text", "text": "请用一句话介绍一下你自己。"}]},
             ],
-            "max_tokens": 64,
+            "max_tokens": 256,
             "temperature": 0.0,
             "extra_body": {
                 "chat_template_kwargs": {"use_tts_template": True},
