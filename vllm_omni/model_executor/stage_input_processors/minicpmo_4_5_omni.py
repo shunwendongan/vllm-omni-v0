@@ -823,6 +823,14 @@ def llm2tts(
             # stay bit-identical (zh WER 0.99% unchanged).
             _mm_req = multi_modal_data.get(llm_output.request_id) if isinstance(multi_modal_data, dict) else None
             _mm_has_data = bool(_mm_req) if isinstance(_mm_req, dict) else bool(_mm_req)
+            # Token-based fallback: image placeholder (151669) or vision
+            # bounds (151652/151653) in the prompt/answer prove visual rows
+            # expanded ahead of text rows, even if the mm payload was not
+            # transported to this stage.
+            if not _mm_has_data:
+                _mm_has_data = any(
+                    t in (151669, 151652, 151653) for t in full_token_ids
+                )
             _hidden_offset = 0
             if _mm_has_data and not is_native_duplex_handoff:
                 _hidden_offset = int(thinker_hidden_states.shape[0]) - len(full_token_ids)
