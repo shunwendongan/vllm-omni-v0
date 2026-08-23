@@ -827,10 +827,13 @@ def llm2tts(
             if _mm_has_data and not is_native_duplex_handoff:
                 _hidden_offset = int(thinker_hidden_states.shape[0]) - len(full_token_ids)
             if _hidden_offset > 0 and _hidden_offset < len(full_token_ids):
+                # end_idx is token-space (tts_eos or hidden count as token
+                # proxy); map BOTH ends by the same offset so the slice keeps
+                # token_ids length. Conditional _h_end (offset only when
+                # tts_eos found) misaligned the no-eos case (439 vs 128).
                 _h_start = tts_bos_idx + _hidden_offset
-                _h_end = end_idx + _hidden_offset if tts_eos_idx is not None else end_idx
+                _h_end = end_idx + _hidden_offset
                 if _h_start >= _h_end or _h_end > thinker_hidden_states.shape[0]:
-                    # Out-of-bounds guard: fall back to direct slice.
                     tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
                 else:
                     tts_hidden_slice = thinker_hidden_states[_h_start:_h_end].to(torch.float32).contiguous()
