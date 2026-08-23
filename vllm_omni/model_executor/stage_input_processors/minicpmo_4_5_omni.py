@@ -830,11 +830,12 @@ def llm2tts(
             if not is_native_duplex_handoff:
                 _hidden_offset = int(thinker_hidden_states.shape[0]) - len(full_token_ids)
                 if _hidden_offset > 0 and _hidden_offset < len(full_token_ids):
-                    # end_idx is token-space (tts_eos or hidden count as
-                    # token proxy); map BOTH ends by the same offset so the
-                    # slice keeps token_ids length.
+                    # end_idx is token-space when tts_eos_idx found, else it
+                    # is already hidden-space (hidden_rows); map each case
+                    # separately. Text-only requests have offset 0 and stay
+                    # bit-identical.
                     _h_start = tts_bos_idx + _hidden_offset
-                    _h_end = end_idx + _hidden_offset
+                    _h_end = end_idx + _hidden_offset if tts_eos_idx is not None else end_idx
                     if _h_start < _h_end and _h_end <= thinker_hidden_states.shape[0]:
                         tts_hidden_slice = thinker_hidden_states[_h_start:_h_end].to(torch.float32).contiguous()
                     else:
