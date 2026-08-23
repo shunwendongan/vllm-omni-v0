@@ -829,6 +829,12 @@ def llm2tts(
             # token_rows) and stay bit-identical (zh WER 0.99% unchanged).
             if not is_native_duplex_handoff:
                 _hidden_offset = int(thinker_hidden_states.shape[0]) - len(full_token_ids)
+                # Vision inputs expand to >=55 hidden rows per image; text-only
+                # has a small baseline drift (<=5, tokenizer/EOF rows) that is
+                # NOT a vision offset and must keep the direct slice
+                # (bit-identical, WER 0.99%). Threshold 8 separates them.
+                if _hidden_offset < 8:
+                    _hidden_offset = 0
                 if _hidden_offset > 0 and _hidden_offset < len(full_token_ids):
                     # end_idx is token-space when tts_eos_idx found, else it
                     # is already hidden-space (hidden_rows); map each case
