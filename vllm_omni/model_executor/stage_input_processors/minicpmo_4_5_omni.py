@@ -815,7 +815,27 @@ def llm2tts(
                     special_token_ids.get("chunk_tts_eos_token_id"),
                 }
             tts_token_ids_slice = torch.tensor(full_token_ids[tts_bos_idx:end_idx], dtype=torch.long)
-            tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
+            # Multimodal inputs (image/audio/video) expand to more hidden rows
+            # than the collapsed <image>/<audio> tokens in token ids (e.g. 1
+            # image token -> 55 rows). All vision rows sit ahead of the text
+            # rows, so every token index at/after the vision region maps to
+            # hidden index + offset. Text-only requests have offset 0 and
+            # stay bit-identical (zh WER 0.99% unchanged).
+            _mm_req = multi_modal_data.get(llm_output.request_id) if isinstance(multi_modal_data, dict) else None
+            _mm_has_data = bool(_mm_req) if isinstance(_mm_req, dict) else bool(_mm_req)
+            _hidden_offset = 0
+            if _mm_has_data and not is_native_duplex_handoff:
+                _hidden_offset = int(thinker_hidden_states.shape[0]) - len(full_token_ids)
+            if _hidden_offset > 0 and _hidden_offset < len(full_token_ids):
+                _h_start = tts_bos_idx + _hidden_offset
+                _h_end = end_idx + _hidden_offset if tts_eos_idx is not None else end_idx
+                if _h_start >= _h_end or _h_end > thinker_hidden_states.shape[0]:
+                    # Out-of-bounds guard: fall back to direct slice.
+                    tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
+                else:
+                    tts_hidden_slice = thinker_hidden_states[_h_start:_h_end].to(torch.float32).contiguous()
+            else:
+                tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
         elif is_native_duplex_handoff:
             # Official MiniCPM-o duplex does not prefill an assistant
             # <|tts_bos|> boundary before generation. A segment delta can
