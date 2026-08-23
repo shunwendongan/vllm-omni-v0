@@ -815,43 +815,7 @@ def llm2tts(
                     special_token_ids.get("chunk_tts_eos_token_id"),
                 }
             tts_token_ids_slice = torch.tensor(full_token_ids[tts_bos_idx:end_idx], dtype=torch.long)
-            # Multimodal inputs (image/audio/video) expand to more hidden rows
-            # than the collapsed <image>/<audio> tokens in token ids (e.g. 1
-            # image token -> 55 rows). All vision rows sit ahead of the text
-            # rows, so every token index at/after the vision region maps to
-            # hidden index + offset. Text-only requests have offset 0 and
-            # stay bit-identical (zh WER 0.99% unchanged).
-            # Vision features expand to more hidden rows than the collapsed
-            # <image>/<video> tokens in token ids (e.g. 1 image token -> 55
-            # rows). All vision rows sit ahead of the text rows, so every
-            # token index at/after the vision region maps to hidden index +
-            # offset. Text-only requests have offset 0 (hidden_rows ==
-            # token_rows) and stay bit-identical (zh WER 0.99% unchanged).
-            if not is_native_duplex_handoff:
-                _hidden_offset = int(thinker_hidden_states.shape[0]) - len(full_token_ids)
-                # Vision inputs expand to >=55 hidden rows per image; text-only
-                # has a small baseline drift (<=5, tokenizer/EOF rows) that is
-                # NOT a vision offset and must keep the direct slice
-                # (bit-identical, WER 0.99%). Threshold 8 separates them.
-                if _hidden_offset < 8:
-                    _hidden_offset = 0
-                if _hidden_offset > 0 and _hidden_offset < len(full_token_ids):
-                    # end_idx is token-space when tts_eos_idx found, else it
-                    # is already hidden-space (hidden_rows); map each case
-                    # separately. Text-only requests have offset 0 and stay
-                    # bit-identical.
-                    _token_end = end_idx if tts_eos_idx is not None else len(full_token_ids)
-                    _h_start = tts_bos_idx + _hidden_offset
-                    _h_end = _token_end + _hidden_offset
-                    if _h_start < _h_end and _h_end <= thinker_hidden_states.shape[0]:
-                        tts_hidden_slice = thinker_hidden_states[_h_start:_h_end].to(torch.float32).contiguous()
-                    else:
-                        tts_hidden_slice = thinker_hidden_states[tts_bos_idx:_token_end].to(torch.float32).contiguous()
-                else:
-                    _token_end2 = end_idx if tts_eos_idx is not None else len(full_token_ids)
-                    tts_hidden_slice = thinker_hidden_states[tts_bos_idx:_token_end2].to(torch.float32).contiguous()
-            else:
-                tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
+            tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
         elif is_native_duplex_handoff:
             # Official MiniCPM-o duplex does not prefill an assistant
             # <|tts_bos|> boundary before generation. A segment delta can
@@ -977,7 +941,6 @@ def llm2tts(
             ref_waveform, ref_sr = ref_audio
             set_ref_audio(model_intermediate_buffer, _to_transport_list(ref_waveform), ref_sr)
         handoff_hidden = _to_transport_list(tts_hidden_slice) if tts_hidden_slice is not None else None
-
         native_turn_end_handoff = False
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
