@@ -35,9 +35,9 @@ def _w4_full_chain_prewarm(port: int) -> None:
             "model": "openbmb/MiniCPM-o-4_5",
             "messages": [
                 {"role": "system", "content": "你是 MiniCPM-o。请简短回答。"},
-                {"role": "user", "content": [{"type": "text", "text": "请用一句话介绍一下你自己。"}]},
+                {"role": "user", "content": [{"type": "text", "text": "北京是中国的首都，是全国的政治、文化、交通、科研和教育中心。北京有着三千多年的建城史和八百多年的建都史，是世界上著名的历史文化名城。"}]},
             ],
-            "max_tokens": 256,
+            "max_tokens": 512,
             "temperature": 0.0,
             "extra_body": {
                 "chat_template_kwargs": {"use_tts_template": True},
