@@ -821,30 +821,26 @@ def llm2tts(
             # rows, so every token index at/after the vision region maps to
             # hidden index + offset. Text-only requests have offset 0 and
             # stay bit-identical (zh WER 0.99% unchanged).
-            _mm_req = multi_modal_data.get(llm_output.request_id) if isinstance(multi_modal_data, dict) else None
-            _mm_has_data = bool(_mm_req) if isinstance(_mm_req, dict) else bool(_mm_req)
-            # Token-based fallback: image placeholder (151669) or vision
-            # bounds (151652/151653) in the prompt/answer prove visual rows
-            # expanded ahead of text rows, even if the mm payload was not
-            # transported to this stage.
-            if not _mm_has_data:
-                _mm_has_data = any(
-                    t in (151669, 151652, 151653) for t in full_token_ids
-                )
-            _hidden_offset = 0
-            if _mm_has_data and not is_native_duplex_handoff:
+            # Vision features expand to more hidden rows than the collapsed
+            # <image>/<video> tokens in token ids (e.g. 1 image token -> 55
+            # rows). All vision rows sit ahead of the text rows, so every
+            # token index at/after the vision region maps to hidden index +
+            # offset. Text-only requests have offset 0 (hidden_rows ==
+            # token_rows) and stay bit-identical (zh WER 0.99% unchanged).
+            if not is_native_duplex_handoff:
                 _hidden_offset = int(thinker_hidden_states.shape[0]) - len(full_token_ids)
-            if _hidden_offset > 0 and _hidden_offset < len(full_token_ids):
-                # end_idx is token-space (tts_eos or hidden count as token
-                # proxy); map BOTH ends by the same offset so the slice keeps
-                # token_ids length. Conditional _h_end (offset only when
-                # tts_eos found) misaligned the no-eos case (439 vs 128).
-                _h_start = tts_bos_idx + _hidden_offset
-                _h_end = end_idx + _hidden_offset
-                if _h_start >= _h_end or _h_end > thinker_hidden_states.shape[0]:
-                    tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
+                if _hidden_offset > 0 and _hidden_offset < len(full_token_ids):
+                    # end_idx is token-space (tts_eos or hidden count as
+                    # token proxy); map BOTH ends by the same offset so the
+                    # slice keeps token_ids length.
+                    _h_start = tts_bos_idx + _hidden_offset
+                    _h_end = end_idx + _hidden_offset
+                    if _h_start < _h_end and _h_end <= thinker_hidden_states.shape[0]:
+                        tts_hidden_slice = thinker_hidden_states[_h_start:_h_end].to(torch.float32).contiguous()
+                    else:
+                        tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
                 else:
-                    tts_hidden_slice = thinker_hidden_states[_h_start:_h_end].to(torch.float32).contiguous()
+                    tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
             else:
                 tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
         elif is_native_duplex_handoff:
