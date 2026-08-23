@@ -834,14 +834,16 @@ def llm2tts(
                     # is already hidden-space (hidden_rows); map each case
                     # separately. Text-only requests have offset 0 and stay
                     # bit-identical.
+                    _token_end = end_idx if tts_eos_idx is not None else len(full_token_ids)
                     _h_start = tts_bos_idx + _hidden_offset
-                    _h_end = end_idx + _hidden_offset if tts_eos_idx is not None else end_idx
+                    _h_end = _token_end + _hidden_offset
                     if _h_start < _h_end and _h_end <= thinker_hidden_states.shape[0]:
                         tts_hidden_slice = thinker_hidden_states[_h_start:_h_end].to(torch.float32).contiguous()
                     else:
-                        tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
+                        tts_hidden_slice = thinker_hidden_states[tts_bos_idx:_token_end].to(torch.float32).contiguous()
                 else:
-                    tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
+                    _token_end2 = end_idx if tts_eos_idx is not None else len(full_token_ids)
+                    tts_hidden_slice = thinker_hidden_states[tts_bos_idx:_token_end2].to(torch.float32).contiguous()
             else:
                 tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
         elif is_native_duplex_handoff:
@@ -969,6 +971,7 @@ def llm2tts(
             ref_waveform, ref_sr = ref_audio
             set_ref_audio(model_intermediate_buffer, _to_transport_list(ref_waveform), ref_sr)
         handoff_hidden = _to_transport_list(tts_hidden_slice) if tts_hidden_slice is not None else None
+
         native_turn_end_handoff = False
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
