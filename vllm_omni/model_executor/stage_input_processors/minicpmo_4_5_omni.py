@@ -829,18 +829,16 @@ def llm2tts(
             # offset. Text-only requests have offset 0 (hidden_rows ==
             # token_rows) and stay bit-identical (zh WER 0.99% unchanged).
             if not is_native_duplex_handoff:
-                _hidden_offset = int(thinker_hidden_states.shape[0]) - len(full_token_ids)
-                # Vision inputs expand to >=55 hidden rows per image; text-only
-                # has a small baseline drift (<=5, tokenizer/EOF rows) that is
-                # NOT a vision offset and must keep the direct slice
-                # (bit-identical, WER 0.99%). Threshold 8 separates them.
-                if _hidden_offset < 8:
-                    _hidden_offset = 0
+                # Multimodal gate: image/video/audio placeholders merge to
+                # unk_token_id 128244 (official minicpmo_4_5_omni_llm.py
+                # merge_multimodal_embeddings). Their features expand to more
+                # hidden rows than token ids; text-only has no 128244 and
+                # stays on the official direct slice (bit-identical,
+                # WER 0.99%). The +5 text-only baseline drift (NPU padding/
+                # EOF rows) is NOT a vision offset and must not shift.
+                _has_mm = any(t == 128244 for t in full_token_ids)
+                _hidden_offset = int(thinker_hidden_states.shape[0]) - len(full_token_ids) if _has_mm else 0
                 if _hidden_offset > 0 and _hidden_offset < len(full_token_ids):
-                    # end_idx is token-space when tts_eos_idx found, else it
-                    # is already hidden-space (hidden_rows); map each case
-                    # separately. Text-only requests have offset 0 and stay
-                    # bit-identical.
                     _token_end = end_idx if tts_eos_idx is not None else len(full_token_ids)
                     _h_start = tts_bos_idx + _hidden_offset
                     _h_end = _token_end + _hidden_offset
@@ -977,6 +975,18 @@ def llm2tts(
         if ref_audio is not None:
             ref_waveform, ref_sr = ref_audio
             set_ref_audio(model_intermediate_buffer, _to_transport_list(ref_waveform), ref_sr)
+        if (
+            tts_token_ids_slice is not None
+            and tts_hidden_slice is not None
+            and tts_token_ids_slice.numel() != tts_hidden_slice.shape[0]
+        ):
+            __import__("logging").getLogger("vllm_omni.tts_handoff").error(
+                "TTS handoff length mismatch: token_ids=%d hidden=%d mm=%s off=%d bos=%d",
+                tts_token_ids_slice.numel(), tts_hidden_slice.shape[0],
+                _has_mm if "_has_mm" in dir() else "?",
+                _hidden_offset if "_hidden_offset" in dir() else -1,
+                tts_bos_idx,
+            )
         handoff_hidden = _to_transport_list(tts_hidden_slice) if tts_hidden_slice is not None else None
         native_turn_end_handoff = False
         if is_native_duplex_handoff:
