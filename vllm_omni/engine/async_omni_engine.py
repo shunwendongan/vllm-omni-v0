@@ -32,15 +32,17 @@ def _w4_full_chain_prewarm(port: int) -> None:
     logger = logging.getLogger("vllm_omni.w4_prewarm")
     try:
         _bodies = [
-            # multi-length synthetic TTS requests covering the eval codec
-            # bucket range (graphs 1..32). Official eval warmup covers the
-            # same buckets; pre-capturing them at boot keeps every measured
-            # round at the warm-state RTF (0.157).
-            {"text": "你好。", "max_tokens": 64},
-            {"text": "请介绍一下你自己。", "max_tokens": 128},
-            {"text": "北京是中国的首都，是全国的政治、文化、交通、科研和教育中心。", "max_tokens": 256},
-            {"text": "北京有着三千多年的建城史和八百多年的建都史，是世界上著名的历史文化名城，也是国际化大都市。", "max_tokens": 384},
-            {"text": "随着科技的进步，人工智能正在改变我们的生活方式，从智能客服到自动驾驶，从医疗诊断到教育辅导，应用越来越广泛，未来将有更大的发展空间。", "max_tokens": 512},
+            # 7 multi-length synthetic TTS requests (5..35 token, step 5)
+            # covering the eval codec bucket range (graphs 1..20+).
+            # Pre-capturing all buckets at boot keeps every measured round
+            # at the warm-state RTF (0.154).
+            {"text": "你好。", "max_tokens": 256},
+            {"text": "请简单介绍一下你自己。", "max_tokens": 256},
+            {"text": "北京是中国的首都，是全国的政治和文化中心。", "max_tokens": 256},
+            {"text": "北京有着三千多年的建城史和八百多年的建都史，是著名的历史文化名城。", "max_tokens": 256},
+            {"text": "随着科技的进步，人工智能正在改变我们的生活方式，从智能客服到自动驾驶。", "max_tokens": 256},
+            {"text": "人工智能在医疗诊断、教育培训、智能制造等领域都有广泛应用，未来潜力巨大。", "max_tokens": 256},
+            {"text": "展望未来，人工智能将更深入地融入各行各业，为人类社会创造更大价值，让我们共同期待。", "max_tokens": 256},
         ]
         body = {
             "model": "openbmb/MiniCPM-o-4_5",
