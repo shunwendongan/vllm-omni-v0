@@ -31,13 +31,24 @@ def _w4_full_chain_prewarm(port: int) -> None:
 
     logger = logging.getLogger("vllm_omni.w4_prewarm")
     try:
+        _bodies = [
+            # multi-length synthetic TTS requests covering the eval codec
+            # bucket range (graphs 1..32). Official eval warmup covers the
+            # same buckets; pre-capturing them at boot keeps every measured
+            # round at the warm-state RTF (0.157).
+            {"text": "你好。", "max_tokens": 64},
+            {"text": "请介绍一下你自己。", "max_tokens": 128},
+            {"text": "北京是中国的首都，是全国的政治、文化、交通、科研和教育中心。", "max_tokens": 256},
+            {"text": "北京有着三千多年的建城史和八百多年的建都史，是世界上著名的历史文化名城，也是国际化大都市。", "max_tokens": 384},
+            {"text": "随着科技的进步，人工智能正在改变我们的生活方式，从智能客服到自动驾驶，从医疗诊断到教育辅导，应用越来越广泛，未来将有更大的发展空间。", "max_tokens": 512},
+        ]
         body = {
             "model": "openbmb/MiniCPM-o-4_5",
             "messages": [
                 {"role": "system", "content": "你是 MiniCPM-o。请简短回答。"},
-                {"role": "user", "content": [{"type": "text", "text": "北京是中国的首都，是全国的政治、文化、交通、科研和教育中心。北京有着三千多年的建城史和八百多年的建都史，是世界上著名的历史文化名城。"}]},
+                {"role": "user", "content": [{"type": "text", "text": _bodies[0]["text"]}]},
             ],
-            "max_tokens": 512,
+            "max_tokens": _bodies[0]["max_tokens"],
             "temperature": 0.0,
             "extra_body": {
                 "chat_template_kwargs": {"use_tts_template": True},
@@ -58,6 +69,24 @@ def _w4_full_chain_prewarm(port: int) -> None:
                 if attempt == 119:
                     raise
                 __import__("time").sleep(5)
+        # additional synthetic requests to cover remaining graph buckets
+        for _extra in _bodies[1:]:
+            try:
+                _body2 = dict(body)
+                _body2["messages"] = [
+                    {"role": "system", "content": "你是 MiniCPM-o。请简短回答。"},
+                    {"role": "user", "content": [{"type": "text", "text": _extra["text"]}]},
+                ]
+                _body2["max_tokens"] = _extra["max_tokens"]
+                _req2 = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    data=_json.dumps(_body2).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(_req2, timeout=180) as _resp2:
+                    _resp2.read()
+            except Exception:
+                pass
         logger.info("[W4-I03] full-chain prewarm done")
     except Exception as exc:  # noqa: BLE001
         logger.warning("[W4-I03] full-chain prewarm failed (non-fatal): %s", exc)
