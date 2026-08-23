@@ -43,9 +43,10 @@ logger = init_logger(__name__)
 _REPETITION_WINDOW = 16
 _REPETITION_PENALTY_CHUNK_SIZE = 16
 _MIN_AUDIO_BUDGET = 128
-_MAX_AUDIO_BUDGET = 340
+_MAX_AUDIO_BUDGET = 2048
 # 3-agent formula constants (task_fc967217606f follow-up):
-# natural codec length zh min100/mean147/p95 203/max293
+# natural codec length zh min100/mean147/p95 203/max293; cap 2048 = official
+# value (340 capped audio at 13.6s for long prompts)
 _AUDIO_TOKENS_PER_TEXT_TOKEN = 10
 _AUDIO_TOKEN_FIXED_OVERHEAD = 48
 # MECHA (机制 A) light-mode flag: set by the runner's local decode loop for
