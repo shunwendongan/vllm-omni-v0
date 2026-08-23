@@ -313,8 +313,6 @@ class AsyncOmniEngine:
         # Launch orchestrator background thread
         startup_future: concurrent.futures.Future = concurrent.futures.Future()
 
-        from vllm_omni.utils.cpu_isolation import isolate_host_thread
-        isolate_host_thread(group=0)
         self.orchestrator_thread = threading.Thread(
             target=self._bootstrap_orchestrator,
             args=(
@@ -428,6 +426,8 @@ class AsyncOmniEngine:
     ) -> None:
         """Create loop, initialize stages, then run Orchestrator."""
 
+        from vllm_omni.utils.cpu_isolation import isolate_host_thread
+        isolate_host_thread(group=0)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
