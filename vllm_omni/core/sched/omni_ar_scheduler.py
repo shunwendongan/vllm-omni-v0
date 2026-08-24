@@ -371,6 +371,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        import os as _os
+        _e3v2 = _os.environ.get("OMNI_TALKER_E3_V2", "0") == "1"
+        if _e3v2:
+            import time as _t
+            _e3v2_t0 = _t.perf_counter()
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -727,6 +732,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return engine_core_outputs
 
+        if _e3v2:
+            import logging as _lg
+            _lg.getLogger("vllm_omni.e3v2").info(
+                "[E3V2] update_total=%.3fms",
+                (_t.perf_counter() - _e3v2_t0) * 1000,
+            )
     def finish_requests(self, request_ids: Any, finished_status: RequestStatus) -> list[tuple[str, int]]:
         """Handles the finish signal from outside the scheduler.
 

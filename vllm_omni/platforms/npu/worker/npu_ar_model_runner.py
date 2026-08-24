@@ -517,6 +517,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self._talker_debug_trace = False
         self._talker_dump_dir: str | None = None
         self._talker_e3 = False
+        self._e3v2 = os.environ.get("OMNI_TALKER_E3_V2", "0") == "1"
+        self._e3v2_step = 0
+        self._e3v2_window_step = 0
+        self._e3v2_acc = {}
         try:
             model_cfg = getattr(self.vllm_config, "model_config", None)
             connector_cfg = getattr(model_cfg, "stage_connector_config", None)
@@ -1129,6 +1133,16 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         _e3 = os.environ.get("OMNI_TALKER_E3", "0") == "1" or getattr(self, "_talker_e3", False)
         _e3_t0 = time.perf_counter()
         _e3_acc = {"prebuild": 0.0, "feedback": 0.0, "metadata": 0.0, "cos": 0.0, "forward": 0.0, "tok": 0.0, "collect": 0.0}
+        if getattr(self, "_e3v2", False) and hasattr(self, "_e3v2_t0"):
+            _e3v2_t_now = time.perf_counter()
+            _e3v2_acc = self._e3v2_acc.setdefault(self._e3v2_step, {})
+            _e3v2_acc["step_start_to_sync"] = (getattr(self, "_e3v2_t_sync", _e3v2_t_now) - self._e3v2_t0) * 1000
+            _e3v2_acc["sync_to_extract"] = (getattr(self, "_e3v2_t_extract", _e3v2_t_now) - getattr(self, "_e3v2_t_sync", self._e3v2_t0)) * 1000
+            _e3v2_acc["step_total"] = (_e3v2_t_now - self._e3v2_t0) * 1000
+            # window bucket tracking
+            self._e3v2_window_step += 1
+            if self._e3v2_window_step % 8 == 1 or self._e3v2_window_step % 8 == 7:
+                _e3v2_acc["boundary_step"] = True
 
         local_batch_desc: Any = None
         try:
@@ -1269,6 +1283,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         hidden_states, multimodal_outputs = _fwd_out
                     else:
                         hidden_states, multimodal_outputs = self.extract_multimodal_outputs(_fwd_out)
+                        if getattr(self, "_e3v2", False) and hasattr(self, "_e3v2_t0"):
+                            self._e3v2_t_extract = _t.perf_counter()
                     # engine token: read cached stop logits WITHOUT consuming
                     if getattr(self, "_mecha_tok", False):
                         tok = self._mecha_engine_tokens(
@@ -1438,6 +1454,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         hidden_states, multimodal_outputs = _fwd_out
                     else:
                         hidden_states, multimodal_outputs = self.extract_multimodal_outputs(_fwd_out)
+                        if getattr(self, "_e3v2", False) and hasattr(self, "_e3v2_t0"):
+                            self._e3v2_t_extract = _t.perf_counter()
                     if getattr(self, "_mecha_tok", False):
                         tok = self._mecha_engine_tokens(
                             num_reqs, req_ids[:num_reqs], hidden_states[:num_reqs]
@@ -1719,10 +1737,20 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> OmniModelRunnerOutput | IntermediateTensors | None:
+        if getattr(self, "_e3v2", False):
+            import time as _t
+            self._e3v2_t0 = _t.perf_counter()
+            self._e3v2_step += 1
+            # window step tracking: K local steps per window
+            if self._omni_async_steps and self._e3v2_step > 0:
+                pass
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = self.routed_experts_capturer
             if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
                 capturer.finalize_pending_copy()
+        if getattr(self, "_e3v2", False):
+            self._sync_device()
+            self._e3v2_t_sync = time.perf_counter()
         if self.ascend_config.profiling_chunk_config.enabled:
             self._sync_device()
             self._execution_start_time = time.perf_counter()
