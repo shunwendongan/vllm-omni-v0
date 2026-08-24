@@ -730,14 +730,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 except Exception:
                     init_logger(__name__).exception("Failed to free blocks for %s after transfer", req_id)
 
-        return engine_core_outputs
-
         if _e3v2:
             import logging as _lg
             _lg.getLogger("vllm_omni.e3v2").info(
                 "[E3V2] update_total=%.3fms",
                 (_t.perf_counter() - _e3v2_t0) * 1000,
             )
+
+        return engine_core_outputs
     def finish_requests(self, request_ids: Any, finished_status: RequestStatus) -> list[tuple[str, int]]:
         """Handles the finish signal from outside the scheduler.
 

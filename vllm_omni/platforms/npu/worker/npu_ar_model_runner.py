@@ -1143,6 +1143,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             self._e3v2_window_step += 1
             if self._e3v2_window_step % 8 == 1 or self._e3v2_window_step % 8 == 7:
                 _e3v2_acc["boundary_step"] = True
+            logger.info(
+                "[E3V2] step=%d start_to_sync=%.3f sync_to_extract=%.3f total=%.3f boundary=%s",
+                self._e3v2_step,
+                _e3v2_acc.get("step_start_to_sync", 0),
+                _e3v2_acc.get("sync_to_extract", 0),
+                _e3v2_acc.get("step_total", 0),
+                _e3v2_acc.get("boundary_step", False),
+            )
 
         local_batch_desc: Any = None
         try:
