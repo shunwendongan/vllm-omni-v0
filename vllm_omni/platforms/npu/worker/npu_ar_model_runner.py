@@ -1284,7 +1284,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     else:
                         hidden_states, multimodal_outputs = self.extract_multimodal_outputs(_fwd_out)
                         if getattr(self, "_e3v2", False) and hasattr(self, "_e3v2_t0"):
-                            self._e3v2_t_extract = _t.perf_counter()
+                            self._e3v2_t_extract = time.perf_counter()
                     # engine token: read cached stop logits WITHOUT consuming
                     if getattr(self, "_mecha_tok", False):
                         tok = self._mecha_engine_tokens(
@@ -1455,7 +1455,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     else:
                         hidden_states, multimodal_outputs = self.extract_multimodal_outputs(_fwd_out)
                         if getattr(self, "_e3v2", False) and hasattr(self, "_e3v2_t0"):
-                            self._e3v2_t_extract = _t.perf_counter()
+                            self._e3v2_t_extract = time.perf_counter()
                     if getattr(self, "_mecha_tok", False):
                         tok = self._mecha_engine_tokens(
                             num_reqs, req_ids[:num_reqs], hidden_states[:num_reqs]
@@ -1739,7 +1739,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     ) -> OmniModelRunnerOutput | IntermediateTensors | None:
         if getattr(self, "_e3v2", False):
             import time as _t
-            self._e3v2_t0 = _t.perf_counter()
+            self._e3v2_t0 = time.perf_counter()
             self._e3v2_step += 1
             # window step tracking: K local steps per window
             if self._omni_async_steps and self._e3v2_step > 0:
