@@ -32,21 +32,21 @@ def _w4_full_chain_prewarm(port: int) -> None:
     logger = logging.getLogger("vllm_omni.w4_prewarm")
     try:
         _bodies = [
-            # 7 multi-length synthetic TTS requests (5..35 token, step 5)
-            # covering the eval codec bucket range (graphs 1..20+).
-            # Pre-capturing all buckets at boot keeps every measured round
-            # at the warm-state RTF (0.154).
-            {"text": "你好。", "max_tokens": 256},
-            {"text": "请简单介绍一下你自己。", "max_tokens": 256},
-            {"text": "北京是中国的首都，是全国的政治和文化中心。", "max_tokens": 256},
-            {"text": "北京有着三千多年的建城史和八百多年的建都史，是著名的历史文化名城。", "max_tokens": 256},
-            {"text": "随着科技的进步，人工智能正在改变我们的生活方式，从智能客服到自动驾驶。", "max_tokens": 256},
-            {"text": "人工智能在医疗诊断、教育培训、智能制造等领域都有广泛应用，未来潜力巨大。", "max_tokens": 256},
-            {"text": "展望未来，人工智能将更深入地融入各行各业，为人类社会创造更大价值，让我们共同期待。", "max_tokens": 256},
-            {"text": "尊敬的各位来宾，欢迎大家参加今天的科技创新大会。今天我们很荣幸邀请到了多位行业专家，共同探讨人工智能与大模型技术的最新进展和未来发展方向。", "max_tokens": 256},
-            {"text": "在过去的几年里，人工智能技术取得了突飞猛进的发展，从自然语言处理到计算机视觉，从语音识别到多模态理解，各项技术都不断突破新的边界，应用场景越来越丰富。", "max_tokens": 256},
-            {"text": "特别是大语言模型的崛起，更是为整个行业带来了革命性的变化。我们看到模型的能力越来越强大，从智能客服到内容创作，从医疗诊断到教育培训，人工智能正在深刻地改变着我们的生活方式和工作方式，展望未来前景广阔。", "max_tokens": 256},
+            # 11 synthetic TTS requests with EXACT 16-26 char texts
+            # matching eval target lengths; each pre-captures its graph bucket.
+            {"text": "北京是中国的首都城市之一啊好的。", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。。", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你。", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好", "max_tokens": 256},
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀", "max_tokens": 256},
         ]
+
         body = {
             "model": "openbmb/MiniCPM-o-4_5",
             "messages": [
