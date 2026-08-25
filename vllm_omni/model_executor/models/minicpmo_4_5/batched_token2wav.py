@@ -4,15 +4,19 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.logger import init_logger
 
 from vllm_omni.benchmarks.ultra_timeline import emit_ultra_timeline_event
+
+logger = init_logger(__name__)
 
 _SILENCE_TOKEN = 4218
 
@@ -62,7 +66,7 @@ class BatchedToken2Wav(nn.Module):
     asset loader and prompt feature extractor.
     """
 
-    def __init__(self, token2wav: Any):
+    def __init__(self, token2wav: Any, *, npu_flow_float16: bool = False):
         super().__init__()
         self._token2wav = token2wav
         self.flow = token2wav.flow
@@ -97,6 +101,11 @@ class BatchedToken2Wav(nn.Module):
             del speech, source
             torch.accelerator.empty_cache()
         self.float16 = bool(token2wav.float16)
+        self._npu_flow_float16_requested = bool(npu_flow_float16)
+        self._npu_autocast_available: bool | None = None
+        self._npu_autocast_fallback_count = 0
+        self._npu_autocast_fallback_reason: str | None = None
+        self._npu_autocast_fallback_error_type: str | None = None
         self.n_timesteps = int(token2wav.n_timesteps)
         self.mel_cache_len = int(token2wav.mel_cache_len)
         self.source_cache_len = int(token2wav.source_cache_len)
@@ -126,6 +135,16 @@ class BatchedToken2Wav(nn.Module):
         num_bytes: int | None = None,
         details: dict[str, object] | None = None,
     ) -> None:
+        if not self._timeline_request_ids:
+            return
+        event_details = dict(details or {})
+        precision = self.precision_telemetry()
+        event_details.update(
+            cfm_steps=self.n_timesteps,
+            flow_requested_dtype=precision["requested_dtype"],
+            flow_effective_dtype=precision["effective_dtype"],
+            flow_precision_fallback_count=precision["fallback_count"],
+        )
         for request_id in self._timeline_request_ids:
             emit_ultra_timeline_event(
                 event,
@@ -134,7 +153,7 @@ class BatchedToken2Wav(nn.Module):
                 stream="compute",
                 shape=shape,
                 num_bytes=num_bytes,
-                details=details,
+                details=event_details,
             )
 
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
@@ -181,6 +200,75 @@ class BatchedToken2Wav(nn.Module):
             dtype=torch.float16,
         )
 
+    @staticmethod
+    def _is_npu_device(device: torch.device) -> bool:
+        return device.type == "npu"
+
+    @staticmethod
+    def _make_npu_autocast() -> AbstractContextManager[Any]:
+        return torch.autocast("npu", dtype=torch.float16)
+
+    def precision_telemetry(self) -> dict[str, int | str | None]:
+        """Return Host-only NPU Flow precision state without device sync."""
+        requested_dtype = "float16" if self._npu_flow_float16_requested else "float32"
+        if not self._npu_flow_float16_requested or self._npu_autocast_available is False:
+            effective_dtype = "float32"
+        elif self._npu_autocast_available is True:
+            effective_dtype = "float16"
+        else:
+            effective_dtype = "pending"
+        return {
+            "requested_dtype": requested_dtype,
+            "effective_dtype": effective_dtype,
+            "fallback_count": self._npu_autocast_fallback_count,
+            "fallback_reason": self._npu_autocast_fallback_reason,
+            "fallback_error_type": self._npu_autocast_fallback_error_type,
+        }
+
+    def _record_npu_autocast_fallback(self, error: BaseException) -> None:
+        if self._npu_autocast_available is False:
+            return
+        self._npu_autocast_available = False
+        self._npu_autocast_fallback_count += 1
+        self._npu_autocast_fallback_reason = "npu_autocast_unavailable"
+        self._npu_autocast_fallback_error_type = type(error).__name__
+        logger.warning(
+            "MiniCPM-o NPU Flow FP16 requested but torch.autocast('npu') is unavailable; "
+            "falling back to FP32 (%s: %s)",
+            type(error).__name__,
+            error,
+        )
+
+    @contextmanager
+    def _npu_flow_autocast(self, device: torch.device) -> Iterator[None]:
+        """Enter NPU FP16 autocast; only context-entry failures fall back."""
+        if not self._npu_flow_float16_requested or not self._is_npu_device(device):
+            yield
+            return
+        if self._npu_autocast_available is False:
+            with _autocast_disabled(device):
+                yield
+            return
+
+        stack = ExitStack()
+        try:
+            stack.enter_context(self._make_npu_autocast())
+        except (AttributeError, AssertionError, NotImplementedError, RuntimeError, TypeError, ValueError) as error:
+            stack.close()
+            if self._npu_autocast_available is True:
+                raise RuntimeError(
+                    "MiniCPM-o NPU Flow autocast became unavailable after FP16 execution; "
+                    "restart the Stage 2 process to avoid mixed-precision cache reuse"
+                ) from error
+            self._record_npu_autocast_fallback(error)
+            with _autocast_disabled(device):
+                yield
+            return
+
+        self._npu_autocast_available = True
+        with stack:
+            yield
+
     def _pre_lookahead_len(self) -> int | None:
         """Right-context width of the encoder's pre-lookahead convolution.
 
@@ -199,14 +287,26 @@ class BatchedToken2Wav(nn.Module):
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        embedded = self.flow.input_embedding(tokens)
-        hidden, new_cnn, new_att = self.flow.encoder.forward_chunk(
-            xs=embedded,
-            last_chunk=last_chunk,
-            cnn_cache=cnn_cache,
-            att_cache=att_cache,
-        )
-        return self.flow.encoder_proj(hidden), new_cnn, new_att
+        if not self._npu_flow_float16_requested or not self._is_npu_device(tokens.device):
+            embedded = self.flow.input_embedding(tokens)
+            hidden, new_cnn, new_att = self.flow.encoder.forward_chunk(
+                xs=embedded,
+                last_chunk=last_chunk,
+                cnn_cache=cnn_cache,
+                att_cache=att_cache,
+            )
+            return self.flow.encoder_proj(hidden), new_cnn, new_att
+
+        with self._npu_flow_autocast(tokens.device):
+            embedded = self.flow.input_embedding(tokens)
+            hidden, new_cnn, new_att = self.flow.encoder.forward_chunk(
+                xs=embedded,
+                last_chunk=last_chunk,
+                cnn_cache=cnn_cache,
+                att_cache=att_cache,
+            )
+            projected = self.flow.encoder_proj(hidden)
+        return projected, new_cnn, new_att
 
     @staticmethod
     def _estimator_buffers(
@@ -240,22 +340,44 @@ class BatchedToken2Wav(nn.Module):
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self._npu_flow_float16_requested or not self._is_npu_device(x.device):
+            time_embedding = estimator.t_embedder(time).unsqueeze(1)
+            width = int(x.shape[-1])
+            speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
+            estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
+            cnn_out, att_out = self._estimator_buffers(estimator, estimator_input, att_cache)
+            old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
+            old_att: Any = att_cache if att_cache is not None else [None] * len(estimator.blocks)
+            result = estimator.blocks_forward_chunk(
+                estimator_input,
+                time_embedding,
+                None,
+                old_cnn,
+                old_att,
+                cnn_out,
+                att_out,
+            )
+            return result, cnn_out, att_out
+
+        # Keep the host-backed timestep embedding in FP32, matching the NPU
+        # Graph boundary. Only the DiT estimator body enters mixed precision.
         time_embedding = estimator.t_embedder(time).unsqueeze(1)
-        width = int(x.shape[-1])
-        speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
-        estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
-        cnn_out, att_out = self._estimator_buffers(estimator, estimator_input, att_cache)
-        old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
-        old_att: Any = att_cache if att_cache is not None else [None] * len(estimator.blocks)
-        result = estimator.blocks_forward_chunk(
-            estimator_input,
-            time_embedding,
-            None,
-            old_cnn,
-            old_att,
-            cnn_out,
-            att_out,
-        )
+        with self._npu_flow_autocast(x.device):
+            width = int(x.shape[-1])
+            speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
+            estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
+            cnn_out, att_out = self._estimator_buffers(estimator, estimator_input, att_cache)
+            old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
+            old_att: Any = att_cache if att_cache is not None else [None] * len(estimator.blocks)
+            result = estimator.blocks_forward_chunk(
+                estimator_input,
+                time_embedding,
+                None,
+                old_cnn,
+                old_att,
+                cnn_out,
+                att_out,
+            )
         return result, cnn_out, att_out
 
     def _decode_cfm(
@@ -278,19 +400,28 @@ class BatchedToken2Wav(nn.Module):
                 f'{{"reason":"noise_capacity","required":{end},'
                 f'"available":{int(decoder.rand_noise.shape[2])}}}'
             )
-        x = decoder.rand_noise[:, :, offset:end].expand(batch_size, -1, -1).clone()
+        npu_mixed_precision = self._npu_flow_float16_requested and self._is_npu_device(mu.device)
+        if npu_mixed_precision:
+            integration_dtype = torch.float32
+            x = decoder.rand_noise[:, :, offset:end].expand(batch_size, -1, -1).clone().float()
+            mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=0).float()
+            speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0).float()
+            cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=0).float()
+        else:
+            integration_dtype = mu.dtype
+            x = decoder.rand_noise[:, :, offset:end].expand(batch_size, -1, -1).clone()
+            mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=0)
+            speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)
+            cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=0)
         timeline = torch.linspace(
             0,
             1,
             self.n_timesteps + 1,
             device=mu.device,
-            dtype=mu.dtype,
+            dtype=integration_dtype,
         )
         timeline = 1 - torch.cos(timeline * 0.5 * torch.pi)
         time = timeline[0].expand(batch_size)
-        mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=0)
-        speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)
-        cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=0)
         next_cnn: list[torch.Tensor] = []
         next_att: list[torch.Tensor] = []
         dt = timeline[1] - timeline[0]
@@ -307,6 +438,8 @@ class BatchedToken2Wav(nn.Module):
                 cnn_cache=old_cnn,
                 att_cache=old_att,
             )
+            if npu_mixed_precision:
+                estimate = estimate.float()
             conditional, unconditional = estimate.split(batch_size, dim=0)
             velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
             x = x + dt * velocity
@@ -530,6 +663,10 @@ class BatchedToken2Wav(nn.Module):
             old_mel = torch.cat([state.hift_cache["mel"] for state in states], dim=0)
             old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
             old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
+        if self._npu_flow_float16_requested and self._is_npu_device(chunk_mel.device):
+            chunk_mel = chunk_mel.float()
+            old_mel = old_mel.float()
+            old_source = old_source.float()
         mel = torch.cat((old_mel, chunk_mel), dim=2)
         self._emit_timeline(
             "hift_begin",
@@ -537,7 +674,11 @@ class BatchedToken2Wav(nn.Module):
             num_bytes=mel.numel() * mel.element_size(),
             details={"dtype": str(mel.dtype)},
         )
-        speech, source = self.hift(mel, old_source)
+        if self._npu_flow_float16_requested and self._is_npu_device(mel.device):
+            with _autocast_disabled(mel.device):
+                speech, source = self.hift(mel, old_source)
+        else:
+            speech, source = self.hift(mel, old_source)
         self._emit_timeline(
             "hift_end",
             shape=tuple(speech.shape),
