@@ -284,6 +284,63 @@ def test_estimator_graph_dispatch_keeps_cached_and_uncached_buckets(monkeypatch,
     )
 
     assert calls[0][0] == "cfm_estimator"
-    assert calls[0][2] == (with_cache,)
+    assert calls[0][2] == (with_cache, "float32")
     assert len(calls[0][1]) == (7 if with_cache else 5)
     torch.testing.assert_close(outputs[0], torch.tensor([4.0]))
+
+
+def test_estimator_graph_dispatch_separates_fp16_and_fallback_epochs(monkeypatch):
+    constants = []
+
+    class _Backend:
+        _npu_flow_float16_requested = True
+        _npu_autocast_available = True
+
+    class _Runner:
+        def run(self, operation, inputs, graph_constants, compute):
+            del operation
+            constants.append(graph_constants)
+            return compute(*inputs)
+
+    backend = _Backend()
+    code2wav_patch._backend_graph_runners[backend] = _Runner()
+
+    def graphable(
+        instance,
+        estimator,
+        *,
+        x,
+        mu,
+        time_embedding,
+        speakers,
+        cond,
+        cnn_cache,
+        att_cache,
+    ):
+        del instance, estimator, time_embedding, speakers, cond, cnn_cache, att_cache
+        marker = x.new_zeros(1)
+        return x + mu, marker, marker.clone()
+
+    monkeypatch.setattr(code2wav_patch, "_original_estimator_step", lambda *args, **kwargs: None)
+    monkeypatch.setattr(code2wav_patch, "_graphable_estimator_step", graphable)
+    value = torch.tensor([2.0])
+    estimator = SimpleNamespace(t_embedder=lambda time: time + 1)
+
+    def dispatch():
+        return code2wav_patch._patched_estimator_step(
+            backend,
+            estimator,
+            x=value,
+            mu=value,
+            time=value,
+            speakers=value,
+            cond=value,
+            cnn_cache=None,
+            att_cache=None,
+        )
+
+    dispatch()
+    backend._npu_autocast_available = False
+    dispatch()
+
+    assert constants == [(False, "float16"), (False, "float32")]
