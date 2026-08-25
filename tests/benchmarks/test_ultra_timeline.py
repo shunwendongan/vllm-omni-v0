@@ -17,6 +17,7 @@ from vllm_omni.benchmarks.ultra_timeline import (
     ULTRA_TIMELINE_SCHEMA_VERSION,
     UltraTimelineRecorder,
     create_ultra_timeline_recorder,
+    emit_ultra_timeline_event,
     resolve_ultra_timeline_path,
 )
 
@@ -116,6 +117,50 @@ def test_path_takes_precedence_over_directory(tmp_path, monkeypatch):
     monkeypatch.setenv(ULTRA_TIMELINE_DIR_ENV, str(tmp_path / "ignored"))
 
     assert resolve_ultra_timeline_path() == explicit_path
+
+
+def test_server_event_is_default_off(tmp_path, monkeypatch):
+    output_path = tmp_path / "events.jsonl"
+    monkeypatch.delenv(ULTRA_TIMELINE_ENV, raising=False)
+    monkeypatch.setenv(ULTRA_TIMELINE_PATH_ENV, str(output_path))
+
+    emit_ultra_timeline_event(
+        "connector_put",
+        request_id="request-off",
+        stage=1,
+        shape=(4, 8),
+        num_bytes=128,
+    )
+
+    assert not output_path.exists()
+
+
+def test_server_event_flushes_metadata_only_record(tmp_path, monkeypatch):
+    output_path = tmp_path / "events.jsonl"
+    monkeypatch.setenv(ULTRA_TIMELINE_ENV, "1")
+    monkeypatch.setenv(ULTRA_TIMELINE_PATH_ENV, str(output_path))
+
+    emit_ultra_timeline_event(
+        "cfm_end",
+        request_id="request-server",
+        turn_id=3,
+        stage=2,
+        chunk_id=7,
+        stream="compute",
+        shape=(1, 80, 50),
+        num_bytes=8000,
+        details={"dtype": "torch.float16"},
+    )
+
+    events = _read_events(output_path)
+    assert len(events) == 1
+    assert events[0]["event"] == "cfm_end"
+    assert events[0]["request_id"] == "request-server"
+    assert events[0]["turn_id"] == 3
+    assert events[0]["chunk_id"] == 7
+    assert events[0]["shape"] == [1, 80, 50]
+    assert events[0]["bytes"] == 8000
+    assert "sha256" not in events[0]
 
 
 def test_raw_capture_writes_sidecar_not_json_payload(tmp_path):

@@ -310,3 +310,47 @@ def create_ultra_timeline_recorder(
     if not ultra_timeline_enabled():
         return _NULL_TIMELINE_RECORDER
     return UltraTimelineRecorder(request_id=request_id, turn_id=turn_id)
+
+
+def emit_ultra_timeline_event(
+    event: str,
+    *,
+    request_id: str | None,
+    turn_id: str | int | None = None,
+    stage: str | int,
+    chunk_id: str | int | None = None,
+    stream: str | None = None,
+    shape: object = None,
+    num_bytes: int | None = None,
+    error: object | None = None,
+    details: Mapping[str, object] | None = None,
+) -> None:
+    """Append one process-local server event without touching device state.
+
+    Model stages and connector workers do not share a reliable request-terminal
+    callback, so server events are flushed immediately instead of being held in
+    a request-local buffer.  The helper deliberately accepts metadata only: a
+    caller cannot accidentally materialize or hash a device tensor through this
+    interface.  Diagnostic failures never affect inference.
+    """
+    if not ultra_timeline_enabled():
+        return
+    try:
+        recorder = UltraTimelineRecorder(
+            request_id=request_id,
+            turn_id=turn_id,
+            capture_raw=False,
+        )
+        recorder.emit(
+            event,
+            stage=stage,
+            chunk_id=chunk_id,
+            stream=stream,
+            shape=shape,
+            num_bytes=num_bytes,
+            error=error,
+            details=details,
+        )
+        recorder.close()
+    except Exception:
+        logger.warning("Unable to emit Ultra server timeline event %s", event, exc_info=True)
