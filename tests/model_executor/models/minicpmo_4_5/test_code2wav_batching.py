@@ -10,7 +10,11 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2WavState,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
+    _CFM_STEPS_ENV,
+    _FLOW_FP16_ENV,
     MiniCPMO45Code2Wav,
+    _parse_token2wav_float16,
+    _parse_token2wav_n_timesteps,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -140,7 +144,7 @@ class _FakeToken2Wav:
         raise AssertionError("sequential __call__ fallback must never be called")
 
 
-def _config(minimum: int = 1):
+def _config(minimum: int = 1, **extra):
     return SimpleNamespace(
         model_config=SimpleNamespace(
             model="/fake/model",
@@ -149,6 +153,7 @@ def _config(minimum: int = 1):
                     "code2wav_min_batch_size": minimum,
                     "prompt_cache_id": "shared",
                     "prompt_wav": "/fake/prompt.wav",
+                    **extra,
                 }
             },
         )
@@ -264,6 +269,265 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     assert cache0.data_ptr() != cache1.data_ptr()
     assert cache0[0, 0, 0, 0, 0].item() == 10
     assert cache1[0, 0, 0, 0, 0].item() == 20
+
+
+@pytest.mark.parametrize("steps", [10, 8, 6])
+def test_token2wav_n_timesteps_accepts_bounded_quality_grid(steps):
+    assert _parse_token2wav_n_timesteps(steps) == steps
+    model = MiniCPMO45Code2Wav(vllm_config=_config(token2wav_n_timesteps=steps))
+    assert model._token2wav_n_timesteps == steps
+    assert model._token2wav_n_timesteps_source == "config"
+
+
+@pytest.mark.parametrize("value", [True, False, 10.0, 8.0, "10", "8", 0, 1, 7, 9, 11, None])
+def test_token2wav_n_timesteps_rejects_non_whitelisted_config_values(value):
+    with pytest.raises(ValueError, match="token2wav_n_timesteps must be an integer"):
+        MiniCPMO45Code2Wav(vllm_config=_config(token2wav_n_timesteps=value))
+
+
+def test_numerical_lab_defaults_to_ten_step_fp32(monkeypatch):
+    monkeypatch.delenv(_CFM_STEPS_ENV, raising=False)
+    monkeypatch.delenv(_FLOW_FP16_ENV, raising=False)
+
+    model = MiniCPMO45Code2Wav(vllm_config=_config())
+
+    assert model._token2wav_n_timesteps == 10
+    assert model._token2wav_n_timesteps_source == "default"
+    assert model._token2wav_float16 is False
+    assert model._token2wav_float16_source == "default"
+
+
+def test_numerical_lab_environment_switches_and_config_priority(monkeypatch):
+    monkeypatch.setenv(_CFM_STEPS_ENV, "6")
+    monkeypatch.setenv(_FLOW_FP16_ENV, "yes")
+
+    environment_model = MiniCPMO45Code2Wav(vllm_config=_config())
+    config_model = MiniCPMO45Code2Wav(
+        vllm_config=_config(
+            token2wav_n_timesteps=8,
+            token2wav_float16=False,
+        )
+    )
+
+    assert environment_model._token2wav_n_timesteps == 6
+    assert environment_model._token2wav_n_timesteps_source == "environment"
+    assert environment_model._token2wav_float16 is True
+    assert environment_model._token2wav_float16_source == "environment"
+    assert config_model._token2wav_n_timesteps == 8
+    assert config_model._token2wav_n_timesteps_source == "config"
+    assert config_model._token2wav_float16 is False
+    assert config_model._token2wav_float16_source == "config"
+
+
+@pytest.mark.parametrize("env_name", [_CFM_STEPS_ENV, _FLOW_FP16_ENV])
+def test_numerical_lab_rejects_invalid_environment_values(monkeypatch, env_name):
+    monkeypatch.delenv(_CFM_STEPS_ENV, raising=False)
+    monkeypatch.delenv(_FLOW_FP16_ENV, raising=False)
+    monkeypatch.setenv(env_name, "invalid")
+
+    with pytest.raises(ValueError, match=env_name):
+        MiniCPMO45Code2Wav(vllm_config=_config())
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (True, True),
+        (False, False),
+        (1, True),
+        (0, False),
+        ("true", True),
+        (" yes ", True),
+        ("on", True),
+        ("false", False),
+        (" no ", False),
+        ("off", False),
+    ],
+)
+def test_token2wav_float16_parses_explicit_boolean_values(value, expected):
+    assert _parse_token2wav_float16(value) is expected
+
+
+@pytest.mark.parametrize("value", [2, -1, 0.0, 1.0, None, "", "enabled", [], {}])
+def test_token2wav_float16_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="token2wav_float16 must be"):
+        _parse_token2wav_float16(value)
+
+
+@pytest.mark.parametrize("steps", [10, 8, 6])
+def test_cfm_steps_execute_exact_count_and_return_finite_fp32_audio(steps):
+    token2wav = _FakeToken2Wav()
+    token2wav.n_timesteps = steps
+    adapter = BatchedToken2Wav(token2wav)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+
+    states = adapter.setup_batch(prompt, 1)
+    calls_after_setup = len(token2wav.flow.decoder.estimator.cfg_batches)
+    audios, _ = adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        prompt,
+        states,
+        last_chunk=True,
+    )
+
+    assert calls_after_setup == steps
+    assert len(token2wav.flow.decoder.estimator.cfg_batches) == 2 * steps
+    assert len(audios) == 1
+    assert audios[0].dtype == torch.float32
+    assert audios[0].numel() > 0
+    assert torch.isfinite(audios[0]).all()
+
+
+class _AutocastSpy:
+    def __init__(self, events, *, enter_error=None):
+        self.events = events
+        self.enter_error = enter_error
+
+    def __enter__(self):
+        self.events.append("autocast-enter")
+        if self.enter_error is not None:
+            raise self.enter_error
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        del exc_type, exc, traceback
+        self.events.append("autocast-exit")
+        return False
+
+
+def _npu_autocast_adapter(monkeypatch, *, enter_error=None):
+    adapter = BatchedToken2Wav(_FakeToken2Wav(), npu_flow_float16=True)
+    events = []
+    monkeypatch.setattr(adapter, "_is_npu_device", lambda _device: True)
+    monkeypatch.setattr(
+        adapter,
+        "_make_npu_autocast",
+        lambda: _AutocastSpy(events, enter_error=enter_error),
+    )
+    return adapter, events
+
+
+def test_npu_flow_autocast_tracks_effective_fp16(monkeypatch):
+    adapter, events = _npu_autocast_adapter(monkeypatch)
+
+    with adapter._npu_flow_autocast(torch.device("cpu")):
+        events.append("flow")
+
+    assert events == ["autocast-enter", "flow", "autocast-exit"]
+    assert adapter.precision_telemetry() == {
+        "requested_dtype": "float16",
+        "effective_dtype": "float16",
+        "fallback_count": 0,
+        "fallback_reason": None,
+        "fallback_error_type": None,
+    }
+
+
+def test_npu_flow_autocast_falls_back_once_when_context_entry_is_unsupported(monkeypatch):
+    adapter, events = _npu_autocast_adapter(
+        monkeypatch,
+        enter_error=RuntimeError("npu autocast is not registered"),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav._autocast_disabled",
+        lambda _device: _AutocastSpy(events),
+    )
+
+    with adapter._npu_flow_autocast(torch.device("cpu")):
+        events.append("first-flow")
+    with adapter._npu_flow_autocast(torch.device("cpu")):
+        events.append("second-flow")
+
+    assert adapter.precision_telemetry() == {
+        "requested_dtype": "float16",
+        "effective_dtype": "float32",
+        "fallback_count": 1,
+        "fallback_reason": "npu_autocast_unavailable",
+        "fallback_error_type": "RuntimeError",
+    }
+
+
+def test_npu_flow_autocast_entry_failure_after_fp16_execution_is_fatal(monkeypatch):
+    adapter, events = _npu_autocast_adapter(monkeypatch)
+
+    with adapter._npu_flow_autocast(torch.device("cpu")):
+        events.append("first-flow")
+    monkeypatch.setattr(
+        adapter,
+        "_make_npu_autocast",
+        lambda: _AutocastSpy(events, enter_error=RuntimeError("autocast lost")),
+    )
+
+    with pytest.raises(RuntimeError, match="restart the Stage 2 process"):
+        with adapter._npu_flow_autocast(torch.device("cpu")):
+            pytest.fail("failed autocast entry must not execute Flow")
+
+    assert adapter.precision_telemetry() == {
+        "requested_dtype": "float16",
+        "effective_dtype": "float16",
+        "fallback_count": 0,
+        "fallback_reason": None,
+        "fallback_error_type": None,
+    }
+
+
+def test_npu_flow_operator_error_propagates_without_precision_fallback(monkeypatch):
+    adapter, events = _npu_autocast_adapter(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="flow failed"):
+        with adapter._npu_flow_autocast(torch.device("cpu")):
+            raise RuntimeError("flow failed")
+
+    assert events == ["autocast-enter", "autocast-exit"]
+    assert adapter.precision_telemetry()["fallback_count"] == 0
+
+
+def test_default_fp32_flow_never_enters_npu_autocast(monkeypatch):
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    monkeypatch.setattr(
+        adapter,
+        "_npu_flow_autocast",
+        lambda _device: pytest.fail("default FP32 path entered NPU autocast"),
+    )
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+
+    states = adapter.setup_batch(prompt, 1)
+    audios, _ = adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        prompt,
+        states,
+        last_chunk=True,
+    )
+
+    assert audios[0].dtype == torch.float32
+
+
+def test_npu_flow_fp16_keeps_hift_fp32_and_output_fp32(monkeypatch):
+    adapter, events = _npu_autocast_adapter(monkeypatch)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav._autocast_disabled",
+        lambda _device: _AutocastSpy(events),
+    )
+    original_hift = adapter.hift.forward
+
+    def hift_spy(mel, source):
+        events.append(("hift", mel.dtype, source.dtype))
+        return original_hift(mel, source)
+
+    monkeypatch.setattr(adapter.hift, "forward", hift_spy)
+    states = adapter.setup_batch(prompt, 1)
+    audios, _ = adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        prompt,
+        states,
+        last_chunk=True,
+    )
+
+    hift_events = [event for event in events if isinstance(event, tuple) and event[0] == "hift"]
+    assert hift_events == [("hift", torch.float32, torch.float32)]
+    assert audios[0].dtype == torch.float32
+    assert torch.isfinite(audios[0]).all()
 
 
 def test_adapter_timeline_context_emits_cfm_and_hift_boundaries(monkeypatch):
@@ -534,6 +798,85 @@ def test_initial_empty_segment_marker_initializes_stream_without_audio():
 
     assert output.multimodal_outputs["model_outputs"][0].numel() > 0
     assert "duplex" in model._states
+
+
+def test_init_only_prepares_state_without_audio_or_codec_progress():
+    model, token2wav = _model()
+    init = _info("early", 0, [])
+    init["meta"].update(
+        {
+            "code_flat_numel": 0,
+            "init_only": True,
+        }
+    )
+
+    init_output = _forward(model, [init])
+
+    assert init_output.multimodal_outputs["model_outputs"][0].numel() == 0
+    assert init_output.multimodal_outputs["meta.init_only"][0].item() is True
+    assert token2wav.hift.calls == []
+    assert model._states["early"].chunk_seq == -1
+    setup_calls = list(token2wav.flow.encoder.calls)
+
+    audio_output = _forward(model, [_info("early", 0, [10, 11])])
+
+    assert audio_output.multimodal_outputs["model_outputs"][0].numel() > 0
+    assert audio_output.multimodal_outputs["meta.init_only"][0].item() is False
+    assert model._states["early"].chunk_seq == 0
+    assert token2wav.flow.encoder.calls == [*setup_calls, 1]
+
+
+def test_duplicate_init_only_is_rejected_and_cleanup_releases_state():
+    model, _ = _model()
+    init = _info("early", 0, [])
+    init["meta"].update({"code_flat_numel": 0, "init_only": True})
+    _forward(model, [init])
+
+    with pytest.raises(RuntimeError, match="duplicate_init_only"):
+        _forward(model, [init])
+
+    model.on_requests_finished(["early"])
+    assert "early" not in model._states
+
+
+def test_init_only_runtime_reference_is_released_on_abort(tmp_path, monkeypatch):
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    model, _ = _model()
+    init = _info("voice", 0, [])
+    init["codes"]["ref"] = torch.tensor([0.0, 0.25, -0.25, 0.0])
+    init["meta"].update(
+        {
+            "code_flat_numel": 0,
+            "init_only": True,
+            "ref_audio_sr": 16000,
+        }
+    )
+    init["meta"].pop("prompt_cache_id")
+
+    _forward(model, [init], request_ids=["internal-voice"])
+
+    prompt_key = model._request_prompt_keys["internal-voice"]
+    prompt_path = Path(model._runtime_prompts[prompt_key].path)
+    assert prompt_path.is_file()
+
+    model.on_requests_finished(["internal-voice"])
+
+    assert "internal-voice" not in model._states
+    assert prompt_key not in model._runtime_prompts
+    assert not prompt_path.exists()
+
+
+def test_init_only_rejects_terminal_or_nonempty_payload():
+    model, _ = _model()
+    terminal = _info("early", 0, [], last_chunk=True)
+    terminal["meta"].update({"code_flat_numel": 0, "init_only": True})
+    nonempty = _info("other", 0, [10])
+    nonempty["meta"]["init_only"] = True
+
+    with pytest.raises(RuntimeError, match="invalid_init_only_payload"):
+        _forward(model, [terminal])
+    with pytest.raises(RuntimeError, match="invalid_init_only_payload"):
+        _forward(model, [nonempty])
 
 
 def test_shared_runtime_prompt_recreates_missing_file_before_second_owner(tmp_path, monkeypatch):
