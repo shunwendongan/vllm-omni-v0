@@ -80,6 +80,13 @@ def _flow_execution_context(device: torch.device, *, require_math: bool):
     return npu_token2wav_sdpa_context(require_math=require_math)
 
 
+def _flow_graph_precision_key(backend: object) -> str:
+    """Separate captured FP16 graphs from a later FP32 fallback epoch."""
+    requested = bool(getattr(backend, "_npu_flow_float16_requested", False))
+    available = getattr(backend, "_npu_autocast_available", None)
+    return "float16" if requested and available is not False else "float32"
+
+
 def _graphable_estimator_step(
     backend,
     estimator,
@@ -93,21 +100,40 @@ def _graphable_estimator_step(
     att_cache,
 ):
     """Run the CFM estimator body after host-backed timestep embedding."""
-    width = int(x.shape[-1])
-    speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
-    estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
-    cnn_out, att_out = backend._estimator_buffers(estimator, estimator_input, att_cache)
-    old_cnn = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
-    old_att = att_cache if att_cache is not None else [None] * len(estimator.blocks)
-    result = estimator.blocks_forward_chunk(
-        estimator_input,
-        time_embedding,
-        None,
-        old_cnn,
-        old_att,
-        cnn_out,
-        att_out,
-    )
+    if not backend._npu_flow_float16_requested:
+        width = int(x.shape[-1])
+        speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
+        estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
+        cnn_out, att_out = backend._estimator_buffers(estimator, estimator_input, att_cache)
+        old_cnn = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
+        old_att = att_cache if att_cache is not None else [None] * len(estimator.blocks)
+        result = estimator.blocks_forward_chunk(
+            estimator_input,
+            time_embedding,
+            None,
+            old_cnn,
+            old_att,
+            cnn_out,
+            att_out,
+        )
+        return result, cnn_out, att_out
+
+    with backend._npu_flow_autocast(x.device):
+        width = int(x.shape[-1])
+        speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
+        estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
+        cnn_out, att_out = backend._estimator_buffers(estimator, estimator_input, att_cache)
+        old_cnn = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
+        old_att = att_cache if att_cache is not None else [None] * len(estimator.blocks)
+        result = estimator.blocks_forward_chunk(
+            estimator_input,
+            time_embedding,
+            None,
+            old_cnn,
+            old_att,
+            cnn_out,
+            att_out,
+        )
     return result, cnn_out, att_out
 
 
@@ -147,11 +173,12 @@ def _patched_estimator_step(
     # The upstream embedder creates a frequency tensor on the host. Keep it
     # outside capture while retaining the tensor-only estimator body in graph.
     time_embedding = estimator.t_embedder(time).unsqueeze(1)
+    precision_key = _flow_graph_precision_key(self)
     if cnn_cache is None:
         return graph_runner.run(
             "cfm_estimator",
             (x, mu, time_embedding, speakers, cond),
-            (False,),
+            (False, precision_key),
             lambda step_x, step_mu, step_time, step_speakers, step_cond: _graphable_estimator_step(
                 self,
                 estimator,
@@ -168,7 +195,7 @@ def _patched_estimator_step(
     return graph_runner.run(
         "cfm_estimator",
         (x, mu, time_embedding, speakers, cond, cnn_cache, att_cache),
-        (True,),
+        (True, precision_key),
         lambda step_x, step_mu, step_time, step_speakers, step_cond, step_cnn, step_att: _graphable_estimator_step(
             self,
             estimator,
