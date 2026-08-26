@@ -32,19 +32,32 @@ def _w4_full_chain_prewarm(port: int) -> None:
     logger = logging.getLogger("vllm_omni.w4_prewarm")
     try:
         _bodies = [
-            # 11 synthetic TTS requests with EXACT 16-26 char texts
-            # matching eval target lengths; each pre-captures its graph bucket.
-            {"text": "北京是中国的首都城市之一啊好的。", "max_tokens": 256},
-            {"text": "北京是中国的首都城市之一啊好的啊。", "max_tokens": 256},
-            {"text": "北京是中国的首都城市之一啊好的啊。。", "max_tokens": 256},
-            {"text": "北京是中国的首都城市之一啊好的啊。你。", "max_tokens": 256},
-            {"text": "北京是中国的首都城市之一啊好的啊。你好呀", "max_tokens": 256},
-            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好", "max_tokens": 256},
-            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀", "max_tokens": 256},
-            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好", "max_tokens": 256},
-            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀", "max_tokens": 256},
-            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好", "max_tokens": 256},
-            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀", "max_tokens": 256},
+            # prewarm v6: cover eval 13-33 char distribution (zh meta.lst
+            # 2020 samples: min=13 max=33 median=23, peak 21-26) with
+            # natural short Chinese sentences; 16 bodies, step ~1.3 chars.
+            {"text": "北京是首都。", "max_tokens": 256},                                  # 6
+            {"text": "北京是中国的首都城市。", "max_tokens": 256},                        # 11
+            {"text": "北京是中国的首都城市之一。", "max_tokens": 256},                    # 13
+            {"text": "北京是中国的首都城市之一啊。", "max_tokens": 256},                  # 15
+            {"text": "北京是中国的首都城市之一啊好的。", "max_tokens": 256},              # 17
+            {"text": "北京是中国的首都城市之一啊好的啊。", "max_tokens": 256},            # 19
+            {"text": "北京是中国的首都城市之一啊好的啊。你。", "max_tokens": 256},        # 21
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀", "max_tokens": 256},      # 23
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好", "max_tokens": 256},    # 24
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀", "max_tokens": 256},  # 25
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好", "max_tokens": 256}, # 26
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀", "max_tokens": 256}, # 27
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好", "max_tokens": 256}, # 28
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀", "max_tokens": 256}, # 29
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀好", "max_tokens": 256}, # 30
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀好呀", "max_tokens": 256}, # 31
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀好呀好", "max_tokens": 256}, # 32
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀好呀好呀", "max_tokens": 256}, # 33
+            {"text": "北京是中国的首都城市之一啊好。", "max_tokens": 256},  # 15
+            {"text": "北京是中国的首都城市之一啊好的呀你了", "max_tokens": 256},  # 18
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀好好好好好", "max_tokens": 256},  # 31
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀好好好好好好", "max_tokens": 256},  # 32
+            {"text": "北京是中国的首都城市之一啊好的啊。你好呀好呀好呀好呀好好好好好好好", "max_tokens": 256},  # 33
         ]
 
         body = {
@@ -116,6 +129,7 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     strip_parent_engine_args,
 )
+from vllm_omni.e2el import _e2el_enabled, _e2el_mark
 from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
 from vllm_omni.diffusion.diffusion_engine import supports_audio_output
 from vllm_omni.engine.async_engine_utils import (
@@ -1390,6 +1404,8 @@ class AsyncOmniEngine:
         a queue + coroutine-switch round-trip.  The Orchestrator receives a
         ready-to-submit OmniEngineCoreRequest.
         """
+        if _e2el_enabled():
+            _e2el_mark(request_id, "r0")
         msg = self._build_add_request_message(
             request_id=request_id,
             prompt=prompt,
