@@ -213,6 +213,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         sample_rate: Any,
     ) -> tuple[str, _RuntimePrompt]:
         sample_rate_hz = int(_scalar(sample_rate, 0))
+        from vllm_omni.experimental.fullduplex.engine.intermediate import normalize_handoff_tensor
+
+        ref_audio = normalize_handoff_tensor(ref_audio)
         waveform = torch.as_tensor(ref_audio, dtype=torch.float32).reshape(-1).cpu().contiguous()
         if sample_rate_hz <= 0:
             raise _batch_error("invalid_ref_audio_sample_rate", sample_rate=sample_rate_hz)
@@ -793,7 +796,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             token2wav = Token2wav(
                 str(token2wav_path),
                 float16=use_float16,
-                n_timesteps=int(extra.get("token2wav_n_timesteps", 2)),
+                n_timesteps=int(extra.get("token2wav_n_timesteps", 3)),
             )
         finally:
             torch.set_default_dtype(previous_dtype)
