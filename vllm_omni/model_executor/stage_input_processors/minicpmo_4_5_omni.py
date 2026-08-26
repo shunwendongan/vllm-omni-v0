@@ -3,6 +3,7 @@
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
 import logging
+import os
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -10,6 +11,7 @@ import torch
 from vllm.inputs import TextPrompt
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
+from vllm_omni.e2el import _e2el_enabled, _e2el_mark
 from vllm_omni.experimental.fullduplex.engine.intermediate import (
     build_duplex_intermediate_buffer,
     set_ref_audio,
@@ -106,10 +108,26 @@ def _coerce_token_id_list(value):
 
 
 def _to_transport_list(value):
+    """Stage0->1 handoff transport value (T44).
+
+    Default (fast) path: encode the CPU tensor as a tagged raw-bytes blob
+    (``{"__t44_tensor__": dtype, "shape": [...], "data": bytes}``) so the
+    EngineCoreRequest msgspec transport carries raw bytes instead of nested
+    Python lists (the tolist() + msgpack path cost 25-45ms/request) and the
+    untyped-dict decoder cannot mangle it (it passes bytes through verbatim).
+    Legacy list path is restored with VLLM_OMNI_HANDOFF_LIST_LEGACY=1.
+    """
     if hasattr(value, "detach"):
         value = value.detach().cpu()
     if isinstance(value, torch.Tensor):
-        return value.tolist()
+        if os.environ.get("VLLM_OMNI_HANDOFF_LIST_LEGACY", "0") == "1":
+            return value.tolist()
+        value = value.contiguous() if not value.is_contiguous() else value
+        return {
+            "__t44_tensor__": str(value.dtype).removeprefix("torch."),
+            "shape": list(value.shape),
+            "data": value.numpy().tobytes(),
+        }
     return value
 
 
@@ -691,6 +709,8 @@ def llm2tts(
         raise ValueError("source_outputs cannot be empty")
 
     llm_outputs = source_outputs
+    if _e2el_enabled() and llm_outputs:
+        _e2el_mark(llm_outputs[0].request_id, "r5")
     tts_inputs = []
 
     if not isinstance(prompt, list):
@@ -838,6 +858,11 @@ def llm2tts(
                 # EOF rows) is NOT a vision offset and must not shift.
                 _has_mm = any(t == 128244 for t in full_token_ids)
                 _hidden_offset = int(thinker_hidden_states.shape[0]) - len(full_token_ids) if _has_mm else 0
+                __import__("logging").getLogger("vllm_omni.gated").warning(
+                    "[gated-dbg] has_mm=%s off=%d hidden=%d tokens=%d bos=%d",
+                    _has_mm, _hidden_offset, thinker_hidden_states.shape[0],
+                    len(full_token_ids), tts_bos_idx,
+                )
                 if _hidden_offset > 0 and _hidden_offset < len(full_token_ids):
                     _token_end = end_idx if tts_eos_idx is not None else len(full_token_ids)
                     _h_start = tts_bos_idx + _hidden_offset
