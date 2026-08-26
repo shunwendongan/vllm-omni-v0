@@ -190,7 +190,7 @@ class BatchedToken2Wav(nn.Module):
         self.float16 = bool(token2wav.float16)
         self.n_timesteps = int(token2wav.n_timesteps)
         import os as _tjs_os
-        _tjs_env = _tjs_os.environ.get("OMNI_TJS_STOP", "0")
+        _tjs_env = _tjs_os.environ.get("OMNI_TJS_STOP", "2")
         self._tjs_stop = int(_tjs_env) if _tjs_env.isdigit() else 0
         self.mel_cache_len = int(token2wav.mel_cache_len)
         self.source_cache_len = int(token2wav.source_cache_len)
