@@ -959,7 +959,7 @@ def merge_pipeline_deploy(
                 engine_args["speculative_config"] = {
                     "method": "ngram",
                     "num_speculative_tokens": 10,
-                    "prompt_lookup_max": 5,
+                    "prompt_lookup_max": 10,
                     "prompt_lookup_min": 1,
                 }
         elif ps.execution_type == StageExecutionType.LLM_GENERATION:
@@ -968,7 +968,7 @@ def merge_pipeline_deploy(
             _addl = engine_args.setdefault("additional_config", {})
             _addl.setdefault("code2wav_enable_npu_graph", True)
             _addl.setdefault("enable_hift_npu_graph", True)
-            _addl.setdefault("code2wav_max_npu_graphs", 32)
+            _addl.setdefault("code2wav_max_npu_graphs", 48)
             _addl.setdefault("hift_npu_graph_max_graphs", 8)
         extras = _build_extras(ps, ds)
         runtime: dict[str, Any] = {"process": True}
