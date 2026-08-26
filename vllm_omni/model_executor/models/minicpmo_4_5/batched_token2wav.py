@@ -189,6 +189,9 @@ class BatchedToken2Wav(nn.Module):
             torch.accelerator.empty_cache()
         self.float16 = bool(token2wav.float16)
         self.n_timesteps = int(token2wav.n_timesteps)
+        import os as _tjs_os
+        _tjs_env = _tjs_os.environ.get("OMNI_TJS_STOP", "0")
+        self._tjs_stop = int(_tjs_env) if _tjs_env.isdigit() else 0
         self.mel_cache_len = int(token2wav.mel_cache_len)
         self.source_cache_len = int(token2wav.source_cache_len)
         self.register_buffer(
@@ -394,6 +397,17 @@ class BatchedToken2Wav(nn.Module):
             x = x + dt * velocity
             next_cnn.append(step_cnn)
             next_att.append(step_att)
+            # TJS: 到 _tjs_stop 步后 break, 用解析解补齐剩余
+            if getattr(self, "_tjs_stop", 0) > 0 and step + 1 >= self._tjs_stop and step + 1 < self.n_timesteps:
+                # 当前 t = timeline[step+1], 剩余 1-t 用当前 velocity 补齐
+                _t_cur = timeline[step + 1]
+                _remain = 1.0 - _t_cur
+                x = x + _remain * velocity
+                # 补齐剩余 cache(用最后一层的 step_cnn/step_att 复制)
+                for _s in range(step + 1, self.n_timesteps):
+                    next_cnn.append(step_cnn)
+                    next_att.append(step_att)
+                break
         return x, torch.stack(next_cnn), torch.stack(next_att)
 
     @staticmethod
@@ -612,6 +626,7 @@ class BatchedToken2Wav(nn.Module):
             "speech": speech[..., -self.source_cache_len :].detach(),
         }
         emitted = speech if last_chunk else speech[..., : -self.source_cache_len]
+
         next_states = [
             BatchedToken2WavState(
                 flow_cache=new_flow[row],
