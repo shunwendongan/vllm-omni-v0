@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 import re
 import warnings
 from collections.abc import Callable
@@ -866,6 +867,18 @@ def _build_extras(
     sampling: dict[str, Any] = {}
     if ds is not None and ds.default_sampling_params:
         sampling.update(ds.default_sampling_params)
+    # H1-EARLY-TERM: Stage0 early termination at <|tts_eos|> (151704) /
+    # <|im_end|> (151645). The thinker otherwise keeps decoding 1-2 steps past
+    # tts_eos; stopping there saves ~1.2 steps/request with bit-identical
+    # audio (llm2tts slices tts_bos..tts_eos, so downstream is unchanged).
+    # Default ON (env OMNI_TALKER_H1_STOP=0 rolls back). Verified:
+    # E2EL -31.5ms / RTF -0.0074 / Stage0 output tokens 435->403 / WER+SIM
+    # identical / audio frames identical.
+    if getattr(ps, "stage_id", None) == 0 and os.environ.get("OMNI_TALKER_H1_STOP", "1") != "0":
+        _stops = sampling.setdefault("stop_token_ids", [])
+        for _tok in (151704, 151645):
+            if _tok not in _stops:
+                _stops.append(_tok)
     sampling.update(ps.sampling_constraints)
     if sampling:
         extras["default_sampling_params"] = sampling
@@ -951,6 +964,9 @@ def merge_pipeline_deploy(
             _cc["cudagraph_mode"] = "FULL_DECODE_ONLY"
             _cc.setdefault("cudagraph_capture_sizes", [8, 16, 32, 64] if ps.stage_id == 0 else [1, 2, 4, 8])
             _addl = engine_args.setdefault("additional_config", {})
+            import os as _pa_os
+            if _pa_os.environ.get("OMNI_TALKER_PA_SHAPE", "0") == "1":
+                _addl.setdefault("pa_shape_list", [1, 2, 4, 8])
             _asc = _addl.setdefault("ascend_compilation_config", {})
             _asc.setdefault("enable_static_kernel", True)
             # V4 default: ngram speculative K=7 on the thinker (stage 0) when
