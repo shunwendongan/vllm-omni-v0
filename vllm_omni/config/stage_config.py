@@ -867,10 +867,13 @@ def _build_extras(
     sampling: dict[str, Any] = {}
     if ds is not None and ds.default_sampling_params:
         sampling.update(ds.default_sampling_params)
+    sampling.update(ps.sampling_constraints)
     # H1-EARLY-TERM: Stage0 early termination at <|tts_eos|> (151704) /
     # <|im_end|> (151645). The thinker otherwise keeps decoding 1-2 steps past
     # tts_eos; stopping there saves ~1.2 steps/request with bit-identical
     # audio (llm2tts slices tts_bos..tts_eos, so downstream is unchanged).
+    # Injected AFTER sampling_constraints update (pipeline-level termination
+    # contract, survives caller overrides -- PR #6182 class of bugs).
     # Default ON (env OMNI_TALKER_H1_STOP=0 rolls back). Verified:
     # E2EL -31.5ms / RTF -0.0074 / Stage0 output tokens 435->403 / WER+SIM
     # identical / audio frames identical.
@@ -879,7 +882,6 @@ def _build_extras(
         for _tok in (151704, 151645):
             if _tok not in _stops:
                 _stops.append(_tok)
-    sampling.update(ps.sampling_constraints)
     if sampling:
         extras["default_sampling_params"] = sampling
     if ds is not None and ds.output_connectors:
