@@ -75,8 +75,7 @@ def _parse_token2wav_float16(value: Any) -> bool:
         if normalized in _FALSE_CONFIG_VALUES:
             return False
     raise ValueError(
-        "MiniCPM-o token2wav_float16 must be a boolean, 0/1, or one of "
-        f"true/false, yes/no, on/off; got {value!r}"
+        f"MiniCPM-o token2wav_float16 must be a boolean, 0/1, or one of true/false, yes/no, on/off; got {value!r}"
     )
 
 
@@ -845,6 +844,9 @@ class MiniCPMO45Code2Wav(nn.Module):
                 # Generation runner wire payloads are flat and tensor-only.
                 # Dotted metadata keys are unflattened again by the output
                 # processor before the full-duplex data plane consumes them.
+                "meta.cache_epoch": [torch.tensor(item.cache_epoch, dtype=torch.int32) for item in items],
+                "meta.chunk_seq": [torch.tensor(item.chunk_seq, dtype=torch.int32) for item in items],
+                "meta.last_chunk": [torch.tensor(item.last_chunk, dtype=torch.bool) for item in items],
                 "meta.duplex_epoch": [torch.tensor(item.duplex_epoch, dtype=torch.int32) for item in items],
                 "meta.duplex_turn_id": [torch.tensor(item.duplex_turn_id, dtype=torch.int32) for item in items],
                 "meta.llm_output_text_utf8": [item.segment_text_utf8 for item in items],

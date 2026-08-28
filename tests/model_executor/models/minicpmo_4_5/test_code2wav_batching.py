@@ -808,6 +808,9 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
 
     payload = output.multimodal_outputs
     assert "meta" not in payload
+    assert payload["meta.cache_epoch"][0].item() == 0
+    assert payload["meta.chunk_seq"][0].item() == 1
+    assert payload["meta.last_chunk"][0].item() is True
     assert payload["meta.duplex_epoch"][0].item() == 3
     assert payload["meta.duplex_turn_id"][0].item() == 7
     torch.testing.assert_close(
