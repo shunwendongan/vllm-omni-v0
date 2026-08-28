@@ -966,16 +966,13 @@ def merge_pipeline_deploy(
             _cc["cudagraph_mode"] = "FULL_DECODE_ONLY"
             _cc.setdefault("cudagraph_capture_sizes", [8, 16, 32, 64] if ps.stage_id == 0 else [1, 2, 4, 8])
             _addl = engine_args.setdefault("additional_config", {})
-            import os as _pa_os
-            if _pa_os.environ.get("OMNI_TALKER_PA_SHAPE", "0") == "1":
-                _addl.setdefault("pa_shape_list", [1, 2, 4, 8])
             _asc = _addl.setdefault("ascend_compilation_config", {})
             _asc.setdefault("enable_static_kernel", True)
             # V4 default: ngram speculative K=7 on the thinker (stage 0) when
             # the official config omits speculative_config entirely.
             if ps.stage_id == 0 and not engine_args.get("speculative_config"):
                 import os as _sk_os
-                _k = int(_sk_os.environ.get("OMNI_TALKER_S0SPEC_K", "10"))
+                _k = int(_sk_os.environ.get("OMNI_TALKER_S0SPEC_K", "14"))
                 engine_args["speculative_config"] = {
                     "method": "ngram",
                     "num_speculative_tokens": _k,

@@ -88,10 +88,11 @@ def _max_audio_tokens(condition_tokens: int) -> int:
     ceiling matches the checkpoint's native generation default and keeps the
     sequence within the Talker's 4096-position context.
 
-    3-agent formula (2026-08-21): budget = max(128, min(340, ct*10+48)).
+    3-agent formula (2026-08-21): budget = max(128, min(2048, ct*10+48)).
     Short conditions get the +48 overhead floor (no truncation of the
-    natural min-100 codec length); long conditions cap at 340 (below the
-    degradation ceiling) so the Talker stays in its training distribution.
+    natural min-100 codec length); long conditions cap at the official 2048
+    ceiling (restored 2026-08-23; previously 340 truncated demo audio at
+    ~14s) so the Talker stays in its training distribution.
     """
     return max(
         _MIN_AUDIO_BUDGET,
