@@ -189,8 +189,10 @@ class BatchedToken2Wav(nn.Module):
             torch.accelerator.empty_cache()
         self.float16 = bool(token2wav.float16)
         self.n_timesteps = int(token2wav.n_timesteps)
+        import os as _sg_os
+        self._single_fast = _sg_os.environ.get("OMNI_TALKER_SINGLE_FAST", "0") == "1"
         import os as _tjs_os
-        _tjs_env = _tjs_os.environ.get("OMNI_TJS_STOP", "2")
+        _tjs_env = _tjs_os.environ.get("OMNI_TJS_STOP", "1")
         self._tjs_stop = int(_tjs_env) if _tjs_env.isdigit() else 0
         self.mel_cache_len = int(token2wav.mel_cache_len)
         self.source_cache_len = int(token2wav.source_cache_len)
@@ -412,6 +414,15 @@ class BatchedToken2Wav(nn.Module):
 
     @staticmethod
     def _split_flow_cache(cache: dict[str, torch.Tensor], batch_size: int) -> list[dict[str, torch.Tensor]]:
+        import os as _sg_os2
+        if batch_size == 1 and _sg_os2.environ.get("OMNI_TALKER_SINGLE_FAST", "0") == "1":
+            # c=1 快路径: 跳过 cat/clone, 直接视图(仅 batch==1 时语义等价)
+            return [{
+                "conformer_cnn_cache": cache["conformer_cnn_cache"][:1].detach().clone(),
+                "conformer_att_cache": cache["conformer_att_cache"][:, :1].detach().clone(),
+                "estimator_cnn_cache": cache["estimator_cnn_cache"][:, :, :2].detach().clone(),
+                "estimator_att_cache": cache["estimator_att_cache"][:, :, :2].detach().clone(),
+            }]
         result: list[dict[str, torch.Tensor]] = []
         for row in range(batch_size):
             result.append(
@@ -438,6 +449,10 @@ class BatchedToken2Wav(nn.Module):
 
     @staticmethod
     def _stack_flow_cache(states: list[BatchedToken2WavState]) -> dict[str, torch.Tensor]:
+        import os as _sg_os3
+        if len(states) == 1 and _sg_os3.environ.get("OMNI_TALKER_SINGLE_FAST", "0") == "1":
+            # c=1 快路径: 单状态直接返回(跳过 cat)
+            return dict(states[0].flow_cache)
         flows = [state.flow_cache for state in states]
         conditional_cnn = [flow["estimator_cnn_cache"][:, :, 0:1] for flow in flows]
         unconditional_cnn = [flow["estimator_cnn_cache"][:, :, 1:2] for flow in flows]
