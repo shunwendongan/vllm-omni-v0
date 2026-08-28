@@ -974,10 +974,12 @@ def merge_pipeline_deploy(
             # V4 default: ngram speculative K=7 on the thinker (stage 0) when
             # the official config omits speculative_config entirely.
             if ps.stage_id == 0 and not engine_args.get("speculative_config"):
+                import os as _sk_os
+                _k = int(_sk_os.environ.get("OMNI_TALKER_S0SPEC_K", "10"))
                 engine_args["speculative_config"] = {
                     "method": "ngram",
-                    "num_speculative_tokens": 10,
-                    "prompt_lookup_max": 10,
+                    "num_speculative_tokens": _k,
+                    "prompt_lookup_max": max(10, _k),
                     "prompt_lookup_min": 1,
                 }
         elif ps.execution_type == StageExecutionType.LLM_GENERATION:
