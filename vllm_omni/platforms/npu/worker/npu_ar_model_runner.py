@@ -47,6 +47,7 @@ from vllm_ascend.worker.model_runner_v1 import graph_capture
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import get_stage_connector_role, stage_sends_async_output
+from vllm_omni.e2el import _e2el_mark
 from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
@@ -510,7 +511,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         overrides. All knobs are runner-side only; K=1 (default) disables the
         feature entirely and the code paths below are inert.
         """
-        self._talker_local_steps = 8
+        self._talker_local_steps = 12
         self._talker_local_stage_id: int | None = 1
         self._talker_cpu_slot_mapping = True
         self._talker_binary_argmax = True
@@ -521,6 +522,11 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self._e3v2_step = 0
         self._e3v2_window_step = 0
         self._e3v2_acc = {}
+        self._e2el = os.environ.get("OMNI_TALKER_E2EL", "0") == "1"
+        self._e2el_req_seen: dict[str, set[str]] = {}
+        self._wc = os.environ.get("OMNI_TALKER_WALLCLOCK", "0") == "1"
+        self._fb_pregen = os.environ.get("OMNI_TALKER_FB_PREGEN", "0") == "1"
+        self._s0wc = os.environ.get("OMNI_TALKER_S0WC", "0") == "1"
         try:
             model_cfg = getattr(self.vllm_config, "model_config", None)
             connector_cfg = getattr(model_cfg, "stage_connector_config", None)
@@ -708,6 +714,15 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             logger.info('[TALKER-LOCAL] eligible PASS: S=%d reqs=%d', S, num_reqs)
         return True
 
+    def _e2el_mark_once(self, request_id: str, phase: str) -> None:
+        """E2EL: mark a phase at most once per request (env-gated, off default)."""
+        if not getattr(self, "_e2el", False):
+            return
+        _seen = self._e2el_req_seen.setdefault(request_id, set())
+        if phase not in _seen:
+            _seen.add(phase)
+            _e2el_mark(request_id, phase)
+
     def _talker_local_window(self, req_idx: int, S: int) -> int:
         """Window size for one request.
 
@@ -808,6 +823,45 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         num_computed = self.input_batch.num_computed_tokens_cpu[req_idx]
         new_pos = int(num_computed) + 1
         bs = self.cache_config.block_size
+        if getattr(self, "_fb_pregen", False) and getattr(self, "_fb_table", None) is not None:
+            # 批量预生成模式: positions/seq_lens 已在窗口起点查表预生成,
+            # 这里只做单行拷贝 + slot + counters + preprocess
+            _tbl = self._fb_table
+            _pos = _tbl["pos"][new_pos]
+            _sl = _tbl["sl"][new_pos]
+            if _pos is not None:
+                self.positions[req_idx].fill_(_pos)
+                self.seq_lens[req_idx].fill_(_sl)
+                if hasattr(self, "optimistic_seq_lens_cpu"):
+                    self.optimistic_seq_lens_cpu[req_idx] = _sl
+                self.input_batch.num_computed_tokens_cpu[req_idx] = new_pos
+                if hasattr(self, "num_computed_tokens"):
+                    self.num_computed_tokens[req_idx].fill_(new_pos)
+                # slot mapping 也查表(跨块时 None 表示跳过)
+                _slot = _tbl["slot"][new_pos]
+                if _slot is not None:
+                    try:
+                        bt = self.input_batch.block_table[0]
+                        bt.slot_mapping.gpu[req_idx].fill_(_slot)
+                        bt.slot_mapping.cpu[req_idx] = _slot
+                    except Exception as exc:
+                        logger.warning("talker local slot mapping failed: %s", exc)
+                # preprocess(codec embed)仍每步必要(依赖上一步采样)
+                req_id = self.input_batch.req_ids[req_idx]
+                req_infos = self.model_intermediate_buffer.get(req_id, {})
+                req_infos["request_id"] = req_id
+                try:
+                    _ids, req_embeds, _upd = self.model.preprocess(
+                        self.input_ids.gpu[req_idx : req_idx + 1],
+                        None,
+                        **req_infos,
+                    )
+                    if req_embeds is not None and req_embeds.numel() > 0:
+                        self.inputs_embeds.gpu[req_idx : req_idx + 1].copy_(req_embeds[:1])
+                except Exception as exc:
+                    logger.warning("talker local feedback preprocess failed: %s", exc)
+                return
+        # 原路径(无预生成或表缺失)
         # CPU slot mapping: block_id * block_size + offset (O40). Only valid
         # when the block row exists (block id 0 = NULL sentinel). The kernel
         # slot for the scheduled token is already correct; this covers the
@@ -1098,6 +1152,37 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if window <= 1 and not from_scratch:
             return hidden_states, multimodal_outputs, positions, [[] for _ in range(num_reqs)], False
 
+        if getattr(self, "_e2el", False):
+            for _rid in req_ids[:num_reqs]:
+                self._e2el_mark_once(_rid, "r8")
+                _e2el_mark(_rid, "ws")
+        if getattr(self, "_wc", False):
+            self._wc_t0 = time.perf_counter()
+            self._wc_ev_start = torch.npu.Event(enable_timing=True)
+            self._wc_ev_start.record()
+            self._wc_log = []
+        if getattr(self, "_fb_pregen", False):
+            # 预生成窗口内 positions/seq_lens/slot 表(确定性递增)
+            try:
+                _base = int(self.input_batch.num_computed_tokens_cpu[0])
+                _bs = self.cache_config.block_size
+                _bt = self.input_batch.block_table[0]
+                _block_np = _bt.block_table.np
+                _tbl = {"pos": {}, "sl": {}, "slot": {}}
+                for _k in range(1, window + 1):
+                    _p = _base + _k
+                    _tbl["pos"][_p] = _p
+                    _tbl["sl"][_p] = _p + 1
+                    _bid = int(_block_np[0, _p // _bs]) if _p // _bs < _block_np.shape[1] else 0
+                    if _bid != 0:
+                        _tbl["slot"][_p] = _bid * _bs + (_p % _bs)
+                    else:
+                        _tbl["slot"][_p] = None
+                self._fb_table = _tbl
+            except Exception as _exc:
+                self._fb_table = None
+                logger.warning("fb pregen failed: %s", _exc)
+
         codec_deltas: list[list[torch.Tensor]] = [[] for _ in range(num_reqs)]
         finished_flags: list[list[bool]] = [[] for _ in range(num_reqs)]
         engine_tokens: list[list[int]] = [[] for _ in range(num_reqs)]
@@ -1144,8 +1229,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if self._e3v2_window_step % 8 == 1 or self._e3v2_window_step % 8 == 7:
                 _e3v2_acc["boundary_step"] = True
             logger.info(
-                "[E3V2] step=%d start_to_sync=%.3f sync_to_extract=%.3f total=%.3f boundary=%s",
+                "[E3V2] step=%d t0=%.6f start_to_sync=%.3f sync_to_extract=%.3f total=%.3f boundary=%s",
                 self._e3v2_step,
+                getattr(self, "_e3v2_t0", 0.0),
                 _e3v2_acc.get("step_start_to_sync", 0),
                 _e3v2_acc.get("sync_to_extract", 0),
                 _e3v2_acc.get("step_total", 0),
@@ -1285,12 +1371,28 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     if _e3:
                         _e3_acc["forward"] += time.perf_counter() - _t
                         _t = time.perf_counter()
+                    if getattr(self, "_wc", False):
+                        self._wc_ev_sync = torch.npu.Event(enable_timing=True)
+                        self._wc_ev_sync.record()
                     if _mecha_light_this and isinstance(_fwd_out, tuple) and len(_fwd_out) == 2:
                         # MECHA light: (raw hidden, light mm dict) — skip the
                         # OmniOutput wrapper + generic walk for non-final steps
                         hidden_states, multimodal_outputs = _fwd_out
                     else:
                         hidden_states, multimodal_outputs = self.extract_multimodal_outputs(_fwd_out)
+                        if getattr(self, "_wc", False):
+                            self._wc_ev_extract = torch.npu.Event(enable_timing=True)
+                            self._wc_ev_extract.record()
+                            # elapsed: start->sync (device queued), sync->extract (device completion)
+                            self._wc_ev_sync.synchronize()
+                            _d1 = self._wc_ev_start.elapsed_time(self._wc_ev_sync)
+                            self._wc_ev_extract.synchronize()
+                            _d2 = self._wc_ev_sync.elapsed_time(self._wc_ev_extract)
+                            self._wc_log.append((step_idx, _d1, _d2))
+                            logger.info(
+                                "[WC] step=%d start_to_sync=%.3fms sync_to_extract=%.3fms",
+                                step_idx, _d1, _d2,
+                            )
                         if getattr(self, "_e3v2", False) and hasattr(self, "_e3v2_t0"):
                             self._e3v2_t_extract = time.perf_counter()
                     # engine token: read cached stop logits WITHOUT consuming
@@ -1372,6 +1474,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 else:
                     collect_step_outputs(multimodal_outputs, tokens_override=tok0)
                 if all(flags and flags[-1] for flags in finished_flags):
+                    if getattr(self, "_e2el", False):
+                        for _rid in req_ids[:num_reqs]:
+                            _e2el_mark(_rid, "r11")
+                            _e2el_mark(_rid, "we")
                     return hidden_states, multimodal_outputs, positions, engine_tokens, True
                 (_, local_batch_desc, _, _local_ntadp, _) = self._determine_batch_execution_and_padding(
                     num_tokens=num_reqs,
@@ -1458,6 +1564,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                             )
                     finally:
                         self._talker_light_next = False
+                    if getattr(self, "_wc", False):
+                        self._wc_ev_sync = torch.npu.Event(enable_timing=True)
+                        self._wc_ev_sync.record()
                     if _mecha_light_this and isinstance(_fwd_out, tuple) and len(_fwd_out) == 2:
                         hidden_states, multimodal_outputs = _fwd_out
                     else:
@@ -1519,6 +1628,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             multimodal_outputs = merged_mm
 
         logger.debug("talker local decode: K=%d S=%d window=%d from_scratch=%s", K, S, window, from_scratch)
+        if getattr(self, "_e2el", False):
+            for _rid in req_ids[:num_reqs]:
+                _e2el_mark(_rid, "r11")
+                _e2el_mark(_rid, "we")
         return hidden_states, multimodal_outputs, self.positions, engine_tokens, True
 
     #  -------------------------------------- Omni-new -------------------------------------------------
@@ -1752,6 +1865,12 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             # window step tracking: K local steps per window
             if self._omni_async_steps and self._e3v2_step > 0:
                 pass
+        _s0wc_on = getattr(self, "_s0wc", False) and getattr(self, "_stage_id", None) == 0
+        if _s0wc_on:
+            import time as _s0t
+            self._s0wc_t0 = _s0t.perf_counter()
+            self._s0wc_buckets = {"prepare": 0.0, "forward": 0.0, "collect": 0.0}
+            self._s0wc_t_prev = self._s0wc_t0
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = self.routed_experts_capturer
             if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
@@ -1901,6 +2020,11 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
                 num_reqs = self.input_batch.num_reqs
                 req_ids = self.input_batch.req_ids
+                if getattr(self, "_e2el", False) and getattr(
+                    self, "_stage_id", None
+                ) == getattr(self, "_talker_local_stage_id", 1):
+                    for _rid in req_ids:
+                        self._e2el_mark_once(_rid, "r7")
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
@@ -2060,6 +2184,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             # update global cos, sin
             update_cos_sin(positions)
 
+        if _s0wc_on:
+            import time as _s0t2
+            self._s0wc_buckets["prepare"] += _s0t2.perf_counter() - self._s0wc_t_prev
+            self._s0wc_t_prev = _s0t2.perf_counter()
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB weight D2D"):
                 self.eplb_updator.forward_before()
@@ -2136,6 +2264,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             ) as kv_connector_output,
         ):
             if not _talker_local_from_scratch:
+                if _s0wc_on:
+                    import time as _s0t3
+                    self._s0wc_buckets["forward"] += _s0t3.perf_counter() - self._s0wc_t_prev
+                    self._s0wc_t_prev = _s0t3.perf_counter()
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
                 )
@@ -2367,6 +2499,19 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        _s0wc_on = getattr(self, "_s0wc", False) and getattr(self, "_stage_id", None) == 0
+        if _s0wc_on:
+            import time as _s0t4
+            self._s0wc_buckets["collect"] += _s0t4.perf_counter() - self._s0wc_t_prev
+            _total = _s0t4.perf_counter() - self._s0wc_t0
+            logger.info(
+                "[S0WC] stage=0 total=%.3fms prepare=%.3f forward=%.3f collect=%.3f other=%.3f",
+                _total * 1000,
+                self._s0wc_buckets["prepare"] * 1000,
+                self._s0wc_buckets["forward"] * 1000,
+                self._s0wc_buckets["collect"] * 1000,
+                (_total - self._s0wc_buckets["prepare"] - self._s0wc_buckets["forward"] - self._s0wc_buckets["collect"]) * 1000,
+            )
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
@@ -2652,8 +2797,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 record_function_or_nullcontext("async_state_update"),
                 torch.npu.stream(global_stream()),
             ):
+                if getattr(self, "_wc", False):
+                    import time as _tw
+                    _wc_up_entry = _tw.perf_counter()
                 global_stream().wait_event(self.sampling_done_event)
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+                if getattr(self, "_wc", False):
+                    import time as _tw2
+                    logger.info("[WC] update_entry_to_exit=%.3fms", (_tw2.perf_counter() - _wc_up_entry) * 1000)
 
         # In async scheduling + PP, broadcast sampled token ids from the
         # last PP rank so other PP ranks can receive them without going
