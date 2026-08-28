@@ -858,11 +858,12 @@ def llm2tts(
                 # EOF rows) is NOT a vision offset and must not shift.
                 _has_mm = any(t == 128244 for t in full_token_ids)
                 _hidden_offset = int(thinker_hidden_states.shape[0]) - len(full_token_ids) if _has_mm else 0
-                __import__("logging").getLogger("vllm_omni.gated").warning(
-                    "[gated-dbg] has_mm=%s off=%d hidden=%d tokens=%d bos=%d",
-                    _has_mm, _hidden_offset, thinker_hidden_states.shape[0],
-                    len(full_token_ids), tts_bos_idx,
-                )
+                if os.environ.get("OMNI_TALKER_GATED_DBG", "0") == "1":
+                    logging.getLogger("vllm_omni.gated").warning(
+                        "[gated-dbg] has_mm=%s off=%d hidden=%d tokens=%d bos=%d",
+                        _has_mm, _hidden_offset, thinker_hidden_states.shape[0],
+                        len(full_token_ids), tts_bos_idx,
+                    )
                 if _hidden_offset > 0 and _hidden_offset < len(full_token_ids):
                     _token_end = end_idx if tts_eos_idx is not None else len(full_token_ids)
                     _h_start = tts_bos_idx + _hidden_offset
