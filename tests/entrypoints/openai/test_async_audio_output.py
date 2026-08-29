@@ -80,6 +80,92 @@ async def test_two_slot_ring_is_bounded_and_delivers_in_order():
 
 
 @pytest.mark.asyncio
+async def test_completed_encoding_keeps_slot_until_ordered_publication():
+    pipeline = AsyncAudioOutputPipeline(max_pending=4)
+    first = pipeline.submit(
+        request_id="req",
+        epoch=0,
+        sequence=0,
+        audio=torch.tensor([1.0]),
+        encoder=lambda audio: float(audio[0]),
+    )
+    second = pipeline.submit(
+        request_id="req",
+        epoch=0,
+        sequence=1,
+        audio=torch.tensor([2.0]),
+        encoder=lambda audio: float(audio[0]),
+    )
+    assert first.future.result(timeout=5) == 1.0
+    with pytest.raises(AudioOutputPipelineError, match="ring is full"):
+        pipeline.submit(
+            request_id="req",
+            epoch=0,
+            sequence=2,
+            audio=torch.tensor([3.0]),
+            encoder=lambda audio: float(audio[0]),
+        )
+
+    assert await pipeline.resolve(first) == 1.0
+    third = pipeline.submit(
+        request_id="req",
+        epoch=0,
+        sequence=2,
+        audio=torch.tensor([3.0]),
+        encoder=lambda audio: float(audio[0]),
+    )
+    assert await pipeline.resolve(second) == 2.0
+    assert await pipeline.resolve(third) == 3.0
+    pipeline.finish("req", epoch=0)
+    pipeline.close()
+
+
+@pytest.mark.asyncio
+async def test_request_rings_do_not_mix_audio_or_sequence_state():
+    pipeline = AsyncAudioOutputPipeline(max_pending=4)
+    left = pipeline.submit(
+        request_id="left",
+        epoch=0,
+        sequence=0,
+        audio=torch.tensor([11.0]),
+        encoder=lambda audio: ("left", float(audio[0])),
+    )
+    right = pipeline.submit(
+        request_id="right",
+        epoch=7,
+        sequence=0,
+        audio=torch.tensor([22.0]),
+        encoder=lambda audio: ("right", float(audio[0])),
+    )
+
+    assert await pipeline.resolve(right) == ("right", 22.0)
+    assert await pipeline.resolve(left) == ("left", 11.0)
+    pipeline.finish("right", epoch=7)
+    pipeline.finish("left", epoch=0)
+    assert pipeline.active_requests == 0
+    pipeline.close()
+
+
+@pytest.mark.asyncio
+async def test_finish_rejects_pending_tail_without_releasing_ring():
+    pipeline = AsyncAudioOutputPipeline()
+    ticket = pipeline.submit(
+        request_id="req",
+        epoch=0,
+        sequence=0,
+        audio=torch.tensor([1.0]),
+        encoder=lambda audio: float(audio[0]),
+    )
+    with pytest.raises(AudioOutputPipelineError, match="pending slots"):
+        pipeline.finish("req", epoch=0)
+    assert pipeline.active_requests == 1
+    assert await pipeline.resolve(ticket) == 1.0
+    pipeline.finish("req", epoch=0)
+    assert pipeline.active_requests == 0
+    pipeline.close()
+
+
+@pytest.mark.asyncio
 async def test_epoch_change_isolates_old_ticket_and_abort_releases_state():
     pipeline = AsyncAudioOutputPipeline(max_pending=4)
     release = threading.Event()

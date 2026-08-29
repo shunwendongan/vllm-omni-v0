@@ -107,10 +107,10 @@ class AsyncAudioOutputPipeline:
 
     def _pinned_host_like(self, tensor: torch.Tensor) -> tuple[torch.Tensor, bool]:
         try:
-            return (
-                torch.empty_like(tensor, dtype=torch.float32, device="cpu", pin_memory=True),
-                True,
-            )
+            host = torch.empty_like(tensor, dtype=torch.float32, device="cpu", pin_memory=True)
+            if host.device.type != "cpu" or not host.is_pinned():
+                raise RuntimeError("pinned host allocation returned an invalid buffer")
+            return host, True
         except (RuntimeError, TypeError):
             if tensor.device.type != "cpu":
                 raise AudioOutputPipelineUnsupportedError("pinned host allocation is unavailable") from None
@@ -181,7 +181,9 @@ class AsyncAudioOutputPipeline:
                 )
             slot_index = sequence % len(ring.slots)
             slot = ring.slots[slot_index]
-            if slot.future is not None and not slot.future.done():
+            # A completed encoding still owns the slot until its ordered
+            # response has been published by ``resolve``.
+            if slot.future is not None:
                 raise AudioOutputPipelineError(f"request {request_id} audio staging ring is full")
             if not self._capacity.acquire(blocking=False):
                 raise AudioOutputPipelineError("global audio encoding queue is full")
