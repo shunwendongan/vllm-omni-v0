@@ -13,6 +13,7 @@ from scripts.run_minicpmo45_numerical_matrix import (
     build_schedule,
     create_evidence_root,
     summarize_json_results,
+    summarize_matrix_runs,
     validate_official_config,
 )
 
@@ -164,3 +165,21 @@ def test_result_summary_preserves_all_repetitions(tmp_path):
     assert summary["metrics"]["failed"] == [1.0, 0.0]
     assert summary["metrics"]["failure_rate"] == [1 / 32]
     assert summary["results"][0]["max_concurrency"] == 1
+
+
+def test_matrix_summary_keeps_dry_runs_distinct_from_failures():
+    def run(status):
+        return {
+            "spec": {"arm": {"name": "S8"}},
+            "status": status,
+            "metrics": {"mean_audio_rtf": [0.4]},
+        }
+
+    summary = summarize_matrix_runs([run("dry-run"), run("failed"), run("completed")])
+
+    assert summary["S8"] == {
+        "completed_runs": 1,
+        "failed_runs": 1,
+        "dry_runs": 1,
+        "metrics": {"mean_audio_rtf": [0.4]},
+    }

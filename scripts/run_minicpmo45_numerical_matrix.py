@@ -371,10 +371,19 @@ def summarize_matrix_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
     by_arm: dict[str, dict[str, Any]] = {}
     for run in runs:
         arm_name = str(run["spec"]["arm"]["name"])
-        arm = by_arm.setdefault(arm_name, {"completed_runs": 0, "failed_runs": 0, "metrics": {}})
-        status_key = "completed_runs" if run.get("status") == "completed" else "failed_runs"
+        arm = by_arm.setdefault(
+            arm_name,
+            {"completed_runs": 0, "failed_runs": 0, "dry_runs": 0, "metrics": {}},
+        )
+        status = run.get("status")
+        if status == "completed":
+            status_key = "completed_runs"
+        elif status == "dry-run":
+            status_key = "dry_runs"
+        else:
+            status_key = "failed_runs"
         arm[status_key] += 1
-        if run.get("status") != "completed":
+        if status != "completed":
             continue
         for name, values in run.get("metrics", {}).items():
             arm["metrics"].setdefault(name, []).extend(values)
