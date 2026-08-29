@@ -94,6 +94,12 @@ from vllm.tool_parsers.streaming import extract_required_tool_call_streaming
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.entrypoints.openai.async_audio_output import (
+    AsyncAudioOutputPipeline,
+    AudioOutputPipelineError,
+    AudioOutputPipelineUnsupportedError,
+    async_audio_output_enabled,
+)
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.image_api_utils import encode_image_base64_with_compression, validate_layered_layers
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
@@ -155,6 +161,55 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
     # Harmony flag (always False for vllm-omni models)
     use_harmony: bool = False
+
+    def _get_async_audio_output_pipeline(self) -> AsyncAudioOutputPipeline | None:
+        if not getattr(self, "_async_audio_output_pipeline_initialized", False):
+            pipeline = AsyncAudioOutputPipeline() if async_audio_output_enabled() else None
+            self._async_audio_output_pipeline = pipeline
+            self._async_audio_output_pipeline_initialized = True
+        return cast(AsyncAudioOutputPipeline | None, self._async_audio_output_pipeline)
+
+    @staticmethod
+    def _audio_meta_scalar(value: object, default: int) -> int:
+        while isinstance(value, (list, tuple)) and value:
+            value = value[-1]
+        if hasattr(value, "item"):
+            value = value.item()
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _audio_pipeline_position(self, request_id: str, mm_output: dict[str, Any]) -> tuple[int, int, bool]:
+        meta = mm_output.get("meta")
+        meta = meta if isinstance(meta, dict) else {}
+        epoch = max(
+            self._audio_meta_scalar(
+                meta.get("cache_epoch", meta.get("duplex_epoch")),
+                0,
+            ),
+            0,
+        )
+        sequence = self._audio_meta_scalar(meta.get("chunk_seq"), -1)
+        counters = getattr(self, "_async_audio_sequences", None)
+        if counters is None:
+            counters = {}
+            self._async_audio_sequences = counters
+        key = (request_id, epoch)
+        if sequence < 0:
+            sequence = int(counters.get(key, 0))
+        counters[key] = sequence + 1
+        last_chunk = bool(self._audio_meta_scalar(meta.get("last_chunk"), 0))
+        return epoch, sequence, last_chunk
+
+    def _abort_async_audio_output(self, request_id: str) -> None:
+        pipeline = getattr(self, "_async_audio_output_pipeline", None)
+        if pipeline is not None:
+            pipeline.abort(request_id)
+        counters = getattr(self, "_async_audio_sequences", None)
+        if counters is not None:
+            for key in [key for key in counters if key[0] == request_id]:
+                counters.pop(key, None)
 
     @property
     def tool_call_id_type(self) -> str:
@@ -1985,8 +2040,27 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     )
                     if req_state is not None and req_state_audio_ref is None:
                         req_state_audio_ref = req_state
+                    chunk_bytes = audio_chunk_pcm_bytes(omni_res)
+
+                    role = self.get_chat_request_role(request)
+                    choices_data = await self._create_audio_choice_async(
+                        omni_res,
+                        role,
+                        request,
+                        request_id=request_id,
+                    )
+                    if isinstance(choices_data, ErrorResponse):
+                        logger.error(
+                            "Skipping audio chunk for request %s: %s",
+                            request_id,
+                            choices_data.error.message,
+                        )
+                        continue
+
+                    # The TTFP endpoint is the first non-empty, encoded packet,
+                    # not an empty Stage-2 control output.
                     now_ts = time.time()
-                    if req_state is not None and req_state.first_audio_ts is None:
+                    if req_state is not None and chunk_bytes > 0 and req_state.first_audio_ts is None:
                         req_state.first_audio_ts = now_ts
                         stage_pools = getattr(self.engine_client.engine, "stage_pools", None)
                         # The orchestrator binds requests by their internal id,
@@ -2006,16 +2080,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             arrival_ts=req_state.request_arrival_ts,
                             now_ts=now_ts,
                         )
-
-                    role = self.get_chat_request_role(request)
-                    choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
-                    if isinstance(choices_data, ErrorResponse):
-                        logger.error(
-                            "Skipping audio chunk for request %s: %s",
-                            request_id,
-                            choices_data.error.message,
-                        )
-                        continue
                     # Only emit finish_reason on the last modality to
                     # comply with OpenAI streaming spec.
                     for choice in choices_data:
@@ -2030,7 +2094,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     # Record per-chunk PCM byte count + arrival timestamp for
                     # audio_underrun_s / audio_continuity_ok_total at finalize.
                     if req_state is not None and req_state.request_arrival_ts > 0:
-                        chunk_bytes = audio_chunk_pcm_bytes(omni_res)
                         if chunk_bytes > 0:
                             req_state.audio_chunk_arrivals_s.append(max(now_ts - req_state.request_arrival_ts, 0.0))
                             req_state.audio_chunk_bytes.append(chunk_bytes)
@@ -2202,6 +2265,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
+        finally:
+            self._abort_async_audio_output(request_id)
         # Send the final done message after all response.n are finished
         yield "data: [DONE]\n\n"
 
@@ -2615,10 +2680,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return choices, usage, prompt_logprobs, prompt_token_ids, kv_transfer_params
 
-    def _create_audio_choice(
-        self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False
-    ) -> list[ChatCompletionResponseChoice] | list[ChatCompletionResponseStreamChoice] | ErrorResponse:
-        choices: list[ChatCompletionResponseChoice] = []
+    @staticmethod
+    def _audio_choice_tensor(omni_outputs: OmniRequestOutput, *, stream: bool) -> tuple[dict[str, Any], Any]:
         final_res = omni_outputs.request_output
         # OMNI: Access multimodal_output from CompletionOutput (outputs[0]), not from RequestOutput
         # Reference: examples/offline_inference/qwen3_omni/end2end.py line 421
@@ -2636,6 +2699,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 audio_tensor = torch.cat(audio_data, dim=-1)
         else:
             audio_tensor = audio_data
+        return mm_output, audio_tensor
+
+    def _create_audio_choice(
+        self,
+        omni_outputs: OmniRequestOutput,
+        role: str,
+        request: ChatCompletionRequest,
+        stream: bool = False,
+        *,
+        _audio_array: Any | None = None,
+        _mm_output: dict[str, Any] | None = None,
+    ) -> list[ChatCompletionResponseChoice] | list[ChatCompletionResponseStreamChoice] | ErrorResponse:
+        choices: list[ChatCompletionResponseChoice] = []
+        final_res = omni_outputs.request_output
+        mm_output, audio_tensor = self._audio_choice_tensor(omni_outputs, stream=stream)
+        if _mm_output is not None:
+            mm_output = _mm_output
+        if _audio_array is not None:
+            audio_tensor = _audio_array
         if audio_tensor is None:
             if not stream:
                 return self._create_error_response("Audio generation completed but no audio was produced.")
@@ -2655,7 +2737,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 )
                 for output in final_res.outputs
             ]
-        audio_tensor = audio_tensor.detach().cpu().float().numpy()
+        if _audio_array is None:
+            audio_tensor = audio_tensor.detach().cpu().float().numpy()
 
         # Ensure audio is 1D (flatten if needed)
         if audio_tensor.ndim > 1:
@@ -2722,6 +2805,52 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     stop_reason=output.stop_reason,
                 )
             choices.append(choice_data)
+        return choices
+
+    async def _create_audio_choice_async(
+        self,
+        omni_outputs: OmniRequestOutput,
+        role: str,
+        request: ChatCompletionRequest,
+        *,
+        request_id: str,
+    ) -> list[ChatCompletionResponseChoice] | list[ChatCompletionResponseStreamChoice] | ErrorResponse:
+        pipeline = self._get_async_audio_output_pipeline()
+        if pipeline is None:
+            return self._create_audio_choice(omni_outputs, role, request, stream=True)
+        mm_output, audio_tensor = self._audio_choice_tensor(omni_outputs, stream=True)
+        if audio_tensor is None or not isinstance(audio_tensor, torch.Tensor) or audio_tensor.numel() == 0:
+            return self._create_audio_choice(omni_outputs, role, request, stream=True)
+        epoch, sequence, last_chunk = self._audio_pipeline_position(request_id, mm_output)
+
+        def encode(audio_array):
+            return self._create_audio_choice(
+                omni_outputs,
+                role,
+                request,
+                stream=True,
+                _audio_array=audio_array,
+                _mm_output=mm_output,
+            )
+
+        try:
+            choices = await pipeline.encode(
+                request_id=request_id,
+                epoch=epoch,
+                sequence=sequence,
+                audio=audio_tensor,
+                encoder=encode,
+            )
+        except (AudioOutputPipelineUnsupportedError, AudioOutputPipelineError) as exc:
+            logger.warning_once(
+                "Async MiniCPM-o audio output unavailable for request %s; using synchronous output: %s",
+                request_id,
+                exc,
+            )
+            self._abort_async_audio_output(request_id)
+            return self._create_audio_choice(omni_outputs, role, request, stream=True)
+        if last_chunk:
+            pipeline.finish(request_id, epoch=epoch)
         return choices
 
     def _create_image_choice(

@@ -16,6 +16,10 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     _parse_token2wav_float16,
     _parse_token2wav_n_timesteps,
 )
+from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
+    _cfm_loop_constants,
+    _graphable_cfm_loop,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -376,6 +380,50 @@ def test_cfm_steps_execute_exact_count_and_return_finite_fp32_audio(steps):
     assert audios[0].dtype == torch.float32
     assert audios[0].numel() > 0
     assert torch.isfinite(audios[0]).all()
+
+
+@pytest.mark.parametrize("steps", [10, 8, 6])
+@pytest.mark.parametrize("with_cache", [False, True], ids=["uncached", "cached"])
+def test_whole_cfm_loop_matches_reference_for_quality_grid(steps, with_cache):
+    token2wav = _FakeToken2Wav()
+    token2wav.n_timesteps = steps
+    adapter = BatchedToken2Wav(token2wav)
+    mu = torch.tensor([[[0.25, -0.5]]], dtype=torch.float32)
+    speakers = torch.tensor([[0.75]], dtype=torch.float32)
+    cond = torch.tensor([[[0.1, -0.2]]], dtype=torch.float32)
+    cnn_cache = None
+    att_cache = None
+    if with_cache:
+        _, cnn_cache, att_cache = adapter._decode_cfm(
+            mu,
+            speakers,
+            cond,
+            cnn_cache=None,
+            att_cache=None,
+        )
+
+    expected = adapter._decode_cfm(
+        mu,
+        speakers,
+        cond,
+        cnn_cache=cnn_cache,
+        att_cache=att_cache,
+    )
+    constants = _cfm_loop_constants(adapter, adapter.flow.decoder.estimator, mu, 1)
+    actual = _graphable_cfm_loop(
+        adapter,
+        adapter.flow.decoder.estimator,
+        constants,
+        mu=mu,
+        speakers=speakers,
+        cond=cond,
+        cnn_cache=cnn_cache,
+        att_cache=att_cache,
+    )
+
+    for reference, whole_loop in zip(expected, actual, strict=True):
+        torch.testing.assert_close(whole_loop, reference)
+        assert torch.isfinite(whole_loop).all()
 
 
 class _AutocastSpy:
@@ -760,6 +808,9 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
 
     payload = output.multimodal_outputs
     assert "meta" not in payload
+    assert payload["meta.cache_epoch"][0].item() == 0
+    assert payload["meta.chunk_seq"][0].item() == 1
+    assert payload["meta.last_chunk"][0].item() is True
     assert payload["meta.duplex_epoch"][0].item() == 3
     assert payload["meta.duplex_turn_id"][0].item() == 7
     torch.testing.assert_close(

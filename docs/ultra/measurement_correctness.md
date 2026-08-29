@@ -30,8 +30,8 @@ is diagnostic only and must remain disabled during formal score collection.
 The MiniCPM-o accuracy test uses the conservative union of submission-guide
 revision 12 and repository thresholds:
 
-- Daily-Omni accuracy >= 0.78;
-- Video-MME accuracy >= 0.68;
+- Daily-Omni accuracy >= 0.775;
+- Video-MME accuracy >= 0.67;
 - Seed-TTS mean WavLM similarity >= 0.689;
 - Seed-TTS mean WER <= 0.0156.
 

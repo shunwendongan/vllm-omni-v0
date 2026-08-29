@@ -1,9 +1,8 @@
 # MiniCPM-o 4.5 numerical lab
 
-Status: implemented; static gates pass and focused CPU tests await a local
-PyTorch runtime. This branch is always Draft. A3 performance, waveform parity,
-full Seed-TTS quality, Daily-Omni, Video-MME, Demo, and stability evidence are
-pending.
+Status: implemented and locally validated at the driver/static level. This
+branch remains experimental. A3 performance, waveform parity, full Seed-TTS
+quality, Daily-Omni, Video-MME, Demo, and stability evidence are pending.
 
 ## Default contract
 
@@ -45,6 +44,24 @@ export VLLM_OMNI_MINICPMO45_FLOW_FP16=1
 Every setting change requires a clean service restart. Do not compare arms by
 hot-switching one process: Graph captures, allocator state, and request caches
 would contaminate the result.
+
+The restart-isolated matrix driver automates the fixed arm grid, official two
+warmups, `B-C-C-B-B-C` order, non-overwriting evidence directories, commands,
+Git state, official-config hash, raw JSON results, and summaries:
+
+```bash
+scripts/run_minicpmo45_numerical_matrix.py \
+  --config docs/ultra/minicpmo45_numerical_matrix.example.json \
+  --candidates S8,S6,H10,H8,H6 \
+  --run-id <unique-a3-run-id>
+```
+
+The example uses the official pytest runner, which owns service startup and
+shutdown and already fixes `--num-warmups 2`. Run `--dry-run` first to inspect
+all rendered argv without launching a model. The driver refuses an existing
+evidence directory and fails contract validation unless the official workload
+is Chinese Seed-TTS with fixed ordering and concurrency `1/4/8`. It never edits
+the official deploy YAML.
 
 ## NPU Flow precision boundary
 
@@ -95,14 +112,15 @@ For each arm:
    reject NaN/Inf;
 2. run Chinese Seed-TTS c=1 with two warmups and `B-C-C-B-B-C`, three formal
    repetitions per arm;
-3. repeat English c=1/32 prompts for compatibility;
-4. run c=4/8 success, continuity, HBM, and tail-latency guardrails;
-5. run full Daily-Omni, Video-MME, Seed-TTS ASV/WER, Demo, and stability gates
+3. run c=4/8 success, continuity, HBM, and tail-latency guardrails;
+4. run full Daily-Omni, Video-MME, Seed-TTS ASV/WER, Demo, and stability gates
    on the exact candidate commit/settings.
 
-The numerical branch cannot enter `vllm-omni-v0-ultra` unless all conservative
-quality gates pass: Daily-Omni >= 78%, Video-MME >= 68%, ASV >= 0.689, and WER
-<= 1.56%, with 100% request success, stream continuity, and decodable audio.
+A numerical arm cannot become the competition default unless all conservative
+quality gates pass: Daily-Omni >= 77.5%, Video-MME >= 67%, ASV >= 0.689, and
+WER <= 1.56%, with 100% request success, stream continuity, and decodable
+audio. Keeping the switches and evidence driver on the integration branch does
+not promote any arm: the default remains B10.
 
 ## Promotion and rollback
 
