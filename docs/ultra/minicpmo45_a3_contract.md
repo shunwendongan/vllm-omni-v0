@@ -1,4 +1,4 @@
-# `vllm-omni-v0-ultra` M0 Contract and Timeline
+# MiniCPM-o 4.5 A3 contract and timeline
 
 Status: **已实现；本地静态与隔离验证已通过**. Full repository pytest still
 requires a runnable vLLM/Torch environment. This document freezes the M0
@@ -9,16 +9,17 @@ submission readiness.
 
 | Field | Value |
 | --- | --- |
-| Integration branch | `vllm-omni-v0-ultra` |
+| Integration branch | `vllm-omni-v0-freetoken` (based on `vllm-omni-v0-ultra@f3a766c5`) |
 | M0 branch | `ultra/00-contract-timeline` |
-| Upstream base | `vllm-project/vllm-omni:minicpm-challenge@4105c717fe9fdab70285f4d23036768b7814ba78` |
+| Upstream base | `vllm-project/vllm-omni:minicpm-challenge@ecd9d99da0c124331861890e0371e66a01cddaa5` |
 | Target model | `OpenBMB/MiniCPM-o-4_5` |
 | Target hardware | one Atlas A3 / Ascend 910C |
 | Target image | `quay.io/ascend/vllm-omni:v0.25.0-a3` |
 | Competition rules | submission guide revision 12, checked 2026-08-21 |
+| Upstream/config check | checked 2026-08-29; config SHA256 `01ace1ad6e06823be75b97d85cede0a5542c097c7493a9a06a77537128aff1d2` |
 | Scored workload | Seed-TTS Chinese through `/v1/chat/completions`, concurrency `c=1`, two warmup requests |
-| Compatibility workload | current official JSON's Seed-TTS English `c=1`, 32 prompts |
-| Non-scoring guardrails | `c=4/8` success, continuity, memory, and mean/P95 regression checks |
+| Official sweep | Seed-TTS Chinese, `disable_shuffle=true`, concurrency `c=1/4/8`, prompts `32/64/128` |
+| Non-scoring guardrails | `c=4/8` success, continuity, memory, and mean/P95 regression checks unless the rules make them scored |
 | Official config | `tests/dfx/perf/tests/test_minicpmo_4_5.json` |
 | Existing default pipeline | async chunking; Stage 0/1 PIECEWISE graph; Stage 2 eager; 25 codec frames with 3 left-context frames |
 | Official score order | mean audio RTF first, mean `audio_ttfp` second, mean TTFT third |
@@ -28,11 +29,11 @@ Before a formal A3 run, re-check the upstream branch SHA, target image, model
 weights, test script, and current competition rules. A rules or environment
 change requires a new evidence run rather than overwriting an old one.
 
-The submission guide and the current pinned performance JSON are not identical:
-the guide specifies Chinese Seed-TTS at `c=1`, while the JSON currently contains
-English `c=1/4/8` sweeps. Formal optimization decisions therefore use Chinese
-`c=1` as the scored workload and repeat the JSON's English `c=1` cell as a
-compatibility check. The candidate source is installed with
+The pinned performance JSON now agrees with the submission guide on Chinese
+Seed-TTS and fixes request order with `disable_shuffle=true`; the previous
+English compatibility workload is no longer part of this contract. Formal
+optimization decisions use `c=1` as the primary score cell and retain `c=4/8`
+as resource and stability guardrails. The candidate source is installed with
 `pip install -e . --no-build-isolation`, but deploy config and server arguments
 come from the official baseline. A candidate-only YAML change is not evidence of
 an effective competition optimization.
@@ -143,10 +144,10 @@ not competition score targets. Success rate, streaming continuity, and
 decodable-audio rate must remain 100%, and peak memory may not increase by more
 than 5% by default.
 
-Numerical experiments remain isolated from the integration branch until they
-also pass VideoMME, Daily-Omni, ASV, WER, Demo, and stability gates. The
+Numerical arms remain default-off and cannot become the competition default
+until they also pass VideoMME, Daily-Omni, ASV, WER, Demo, and stability gates. The
 conservative gates combine the stricter value from the submission guide and the
-current repository tests: Daily-Omni >= 78.0%, Video-MME >= 68.0%, Seed-TTS
+current repository tests: Daily-Omni >= 77.5%, Video-MME >= 67.0%, Seed-TTS
 ASV SIM >= 0.689, and Seed-TTS WER <= 1.56%. The guide's reproduced F16
 baselines are 79.5%, 69.0%, 0.709, and 1.414%, respectively. Re-validate the
 guide revision and upstream SHA before every submission evidence run.

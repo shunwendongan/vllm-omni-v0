@@ -13,9 +13,9 @@ continue to use `codec_chunk_frames`. Early `init_only` setup remains a control
 packet and does not consume codec offset or `chunk_seq=0`.
 
 Upstream's reported A3 result is hypothesis evidence, not a result for this
-stack. It used English Seed-TTS and an explicit YAML value of 8; this
-competition stack must be judged on the frozen Chinese c=1 workload and the
-RTF-first promotion rule.
+stack. It used a workload that predates the current Chinese Seed-TTS contract
+and an explicit YAML value of 8; this competition stack must be judged on the
+frozen Chinese c=1 workload and the RTF-first promotion rule.
 
 ## Configuration precedence
 

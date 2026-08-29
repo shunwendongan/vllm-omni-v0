@@ -6,7 +6,7 @@ overlap, and complete quality evidence remain pending.
 
 ## Baseline audit
 
-The frozen `minicpm-challenge@4105c717` branch does not contain the batched
+The current integration base `minicpm-challenge@ecd9d99d` does not contain the batched
 MiniCPM-o Talker codec-sampling implementation merged into upstream main by
 [PR #5792](https://github.com/vllm-project/vllm-omni/pull/5792). Its active
 Talker still runs codec projection, repetition penalty, top-p/top-k filtering,
@@ -50,6 +50,7 @@ without those facts could return incomplete audio or race buffer reuse.
 
 - Codec IDs, per-request RNG, EOS/limit behavior, and duplex metadata match.
 - A3 timeline shows lower Talker output latency or CPU overhead.
-- Chinese Seed-TTS c=1 RTF/TTFP/TTFT gates pass; English compatibility passes.
+- Chinese Seed-TTS c=1 RTF/TTFP/TTFT gates pass under the current official
+  fixed-order workload; c=4/8 remain resource and stability guardrails.
 - Daily-Omni, Video-MME, ASV, and WER complete gates pass.
 - c=4/8 request success, tail latency, and HBM remain regression guardrails.
