@@ -103,6 +103,9 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
     parse_size,
     validate_layered_layers,
 )
+from vllm_omni.entrypoints.openai.minicpmo45_prewarm import (
+    build_prewarm_coordinator,
+)
 from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
     OpenAICreateAudioGenerateRequest,
@@ -587,6 +590,9 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             await shutdown_task
         finally:
             state = getattr(app, "state", None)
+            prewarm = getattr(state, "minicpmo45_prewarm", None) if state is not None else None
+            if prewarm is not None:
+                await prewarm.shutdown()
             serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
             if serving_speech is not None:
                 serving_speech.shutdown()
@@ -1141,6 +1147,13 @@ async def omni_init_app_state(
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
+    state.minicpmo45_prewarm = build_prewarm_coordinator(
+        stage_configs=state.stage_configs,
+        chat_service=state.openai_serving_chat,
+        engine_client=engine_client,
+        model_name=model_name,
+    )
+    state.minicpmo45_prewarm.start()
 
 
 def Omnivideo(request: Request) -> OmniOpenAIServingVideo | None:
@@ -1698,9 +1711,43 @@ async def health(raw_request: Request) -> JSONResponse:
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
         )
 
+    prewarm = getattr(raw_request.app.state, "minicpmo45_prewarm", None)
+    if prewarm is not None:
+        snapshot = prewarm.snapshot()
+        if snapshot.status == "failed":
+            return JSONResponse(
+                content={
+                    "status": "unhealthy",
+                    "ready": False,
+                    "prewarm": snapshot.status,
+                    "reason": snapshot.error,
+                },
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            )
+        if snapshot.status == "warming" and snapshot.ready_gate:
+            return JSONResponse(
+                content={
+                    "status": "warming",
+                    "ready": False,
+                    "prewarm": snapshot.status,
+                    "completed_prompts": snapshot.completed_prompts,
+                },
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            )
+
     try:
         await engine_client.check_health()
-        return JSONResponse(content={"status": "healthy"})
+        if prewarm is None:
+            return JSONResponse(content={"status": "healthy"})
+        snapshot = prewarm.snapshot()
+        return JSONResponse(
+            content={
+                "status": "healthy",
+                "ready": True,
+                "prewarm": snapshot.status,
+                "completed_prompts": snapshot.completed_prompts,
+            }
+        )
     except EngineDeadError:
         return JSONResponse(
             content={"status": "unhealthy"},

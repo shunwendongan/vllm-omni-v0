@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections import OrderedDict
+from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
+from threading import RLock
 from typing import Any
 
 import torch
@@ -50,12 +52,22 @@ class PromptFeatures:
     speech_tokens: torch.Tensor
     speaker_embedding: torch.Tensor
     mels: torch.Tensor
+    cache_key: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
 class BatchedToken2WavState:
     flow_cache: dict[str, torch.Tensor]
     hift_cache: dict[str, torch.Tensor]
+
+
+@dataclass
+class _PromptStateCacheEntry:
+    features: PromptFeatures
+    setup_template: BatchedToken2WavState | None
+    owners: set[str]
+    num_bytes: int
+    is_default: bool
 
 
 class BatchedToken2Wav(nn.Module):
@@ -66,7 +78,16 @@ class BatchedToken2Wav(nn.Module):
     asset loader and prompt feature extractor.
     """
 
-    def __init__(self, token2wav: Any, *, npu_flow_float16: bool = False):
+    def __init__(
+        self,
+        token2wav: Any,
+        *,
+        npu_flow_float16: bool = False,
+        prompt_state_cache: bool = False,
+        prompt_cache_max_entries: int = 16,
+        prompt_cache_max_bytes: int = 512 * 1024 * 1024,
+        default_prompt_key: tuple[str, str] | None = None,
+    ):
         super().__init__()
         self._token2wav = token2wav
         self.flow = token2wav.flow
@@ -114,7 +135,24 @@ class BatchedToken2Wav(nn.Module):
             token2wav.speech_window.detach().clone(),
             persistent=False,
         )
+        self._prompt_state_cache_enabled = bool(prompt_state_cache)
+        self._prompt_cache_max_entries = int(prompt_cache_max_entries)
+        self._prompt_cache_max_bytes = int(prompt_cache_max_bytes)
+        if self._prompt_cache_max_entries < 1:
+            raise ValueError("prompt_cache_max_entries must be >= 1")
+        if self._prompt_cache_max_bytes < 1:
+            raise ValueError("prompt_cache_max_bytes must be >= 1")
+        self._default_prompt_key = default_prompt_key
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
+        self._prompt_state_entries: OrderedDict[
+            tuple[str, str], _PromptStateCacheEntry
+        ] = OrderedDict()
+        self._prompt_cache_lock = RLock()
+        self._prompt_cache_hits = 0
+        self._prompt_cache_misses = 0
+        self._prompt_cache_evictions = 0
+        self._prompt_cache_skips = 0
+        self._prompt_cache_current_bytes = 0
         self._timeline_request_ids: tuple[str, ...] = ()
 
     @contextmanager
@@ -156,31 +194,240 @@ class BatchedToken2Wav(nn.Module):
                 details=event_details,
             )
 
+    @staticmethod
+    def _tensor_tree_bytes(value: Any) -> int:
+        if isinstance(value, torch.Tensor):
+            return int(value.numel()) * int(value.element_size())
+        if isinstance(value, Mapping):
+            return sum(BatchedToken2Wav._tensor_tree_bytes(item) for item in value.values())
+        if isinstance(value, (tuple, list)):
+            return sum(BatchedToken2Wav._tensor_tree_bytes(item) for item in value)
+        return 0
+
+    @classmethod
+    def _entry_bytes(
+        cls,
+        features: PromptFeatures,
+        setup_template: BatchedToken2WavState | None,
+    ) -> int:
+        feature_bytes = sum(
+            cls._tensor_tree_bytes(value)
+            for value in (
+                features.speech_tokens,
+                features.speaker_embedding,
+                features.mels,
+            )
+        )
+        if setup_template is None:
+            return feature_bytes
+        return (
+            feature_bytes
+            + cls._tensor_tree_bytes(setup_template.flow_cache)
+            + cls._tensor_tree_bytes(setup_template.hift_cache)
+        )
+
+    @staticmethod
+    def _clone_state_template(
+        template: BatchedToken2WavState,
+    ) -> BatchedToken2WavState:
+        """Create a request-owned deep Tensor clone of a batch-one template."""
+        return BatchedToken2WavState(
+            flow_cache={
+                name: value.detach().clone()
+                for name, value in template.flow_cache.items()
+            },
+            hift_cache={
+                name: value.detach().clone()
+                for name, value in template.hift_cache.items()
+            },
+        )
+
+    def _cache_details_locked(self) -> dict[str, int]:
+        return {
+            "hits": self._prompt_cache_hits,
+            "misses": self._prompt_cache_misses,
+            "evictions": self._prompt_cache_evictions,
+            "skips": self._prompt_cache_skips,
+            "entries": len(self._prompt_state_entries),
+            "current_bytes": self._prompt_cache_current_bytes,
+            "max_entries": self._prompt_cache_max_entries,
+            "max_bytes": self._prompt_cache_max_bytes,
+        }
+
+    def prompt_cache_telemetry(self) -> dict[str, int | bool]:
+        """Return Host-only cache counters without touching accelerator state."""
+        with self._prompt_cache_lock:
+            return {
+                "enabled": self._prompt_state_cache_enabled,
+                **self._cache_details_locked(),
+            }
+
+    def _emit_prompt_cache_event(
+        self,
+        event: str,
+        *,
+        cache_key: tuple[str, str],
+        details: dict[str, object] | None = None,
+    ) -> None:
+        event_details = {
+            "prompt_cache_id": cache_key[0],
+            **self.prompt_cache_telemetry(),
+            **dict(details or {}),
+        }
+        self._emit_timeline(event, details=event_details)
+
+    def _store_prompt_entry(
+        self,
+        cache_key: tuple[str, str],
+        features: PromptFeatures,
+        setup_template: BatchedToken2WavState | None,
+    ) -> bool:
+        """Store one entry, evicting only inactive non-default LRU entries."""
+        entry_bytes = self._entry_bytes(features, setup_template)
+        evicted_keys: list[tuple[str, str]] = []
+        skipped = False
+        with self._prompt_cache_lock:
+            previous = self._prompt_state_entries.pop(cache_key, None)
+            if previous is not None:
+                self._prompt_cache_current_bytes -= previous.num_bytes
+            is_default = cache_key == self._default_prompt_key
+
+            while (
+                len(self._prompt_state_entries) + 1 > self._prompt_cache_max_entries
+                or self._prompt_cache_current_bytes + entry_bytes
+                > self._prompt_cache_max_bytes
+            ):
+                victim_key = next(
+                    (
+                        key
+                        for key, candidate in self._prompt_state_entries.items()
+                        if not candidate.is_default and not candidate.owners
+                    ),
+                    None,
+                )
+                if victim_key is None:
+                    break
+                victim = self._prompt_state_entries.pop(victim_key)
+                self._prompt_cache_current_bytes -= victim.num_bytes
+                self._prompt_cache_evictions += 1
+                evicted_keys.append(victim_key)
+
+            fits = (
+                len(self._prompt_state_entries) + 1 <= self._prompt_cache_max_entries
+                and self._prompt_cache_current_bytes + entry_bytes
+                <= self._prompt_cache_max_bytes
+            )
+            if not fits and not is_default:
+                skipped = True
+                self._prompt_cache_skips += 1
+                if previous is not None:
+                    self._prompt_state_entries[cache_key] = previous
+                    self._prompt_cache_current_bytes += previous.num_bytes
+            else:
+                owners = set(previous.owners) if previous is not None else set()
+                self._prompt_state_entries[cache_key] = _PromptStateCacheEntry(
+                    features=features,
+                    setup_template=setup_template,
+                    owners=owners,
+                    num_bytes=entry_bytes,
+                    is_default=is_default,
+                )
+                self._prompt_cache_current_bytes += entry_bytes
+
+        for victim_key in evicted_keys:
+            self._emit_prompt_cache_event(
+                "prompt_state_cache_eviction",
+                cache_key=victim_key,
+            )
+        if skipped:
+            self._emit_prompt_cache_event(
+                "prompt_state_cache_skip",
+                cache_key=cache_key,
+                details={"entry_bytes": entry_bytes},
+            )
+        return not skipped
+
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)
-        cached = self._prompt_features.get(cache_key)
-        if cached is None:
-            # The generation runner may wrap model.forward in bf16 autocast,
-            # and vLLM constructs the model under a bf16 default dtype, while
-            # S3Tokenizer prompt extraction uses fp32 convolution weights.
-            previous_dtype = torch.get_default_dtype()
-            try:
-                torch.set_default_dtype(torch.float32)
-                with _autocast_disabled(self.speech_window.device):
-                    values = self._token2wav._prepare_prompt(prompt_wav)
-            finally:
-                torch.set_default_dtype(previous_dtype)
-            cached = PromptFeatures(
-                speech_tokens=values[0],
-                speaker_embedding=values[2],
-                mels=values[3],
-            )
-            self._prompt_features[cache_key] = cached
-        return cached
+        if self._prompt_state_cache_enabled:
+            with self._prompt_cache_lock:
+                entry = self._prompt_state_entries.get(cache_key)
+                if entry is not None:
+                    self._prompt_state_entries.move_to_end(cache_key)
+                    return entry.features
+        else:
+            cached = self._prompt_features.get(cache_key)
+            if cached is not None:
+                return cached
+
+        # The generation runner may wrap model.forward in bf16 autocast,
+        # and vLLM constructs the model under a bf16 default dtype, while
+        # S3Tokenizer prompt extraction uses fp32 convolution weights.
+        previous_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.float32)
+            with _autocast_disabled(self.speech_window.device):
+                values = self._token2wav._prepare_prompt(prompt_wav)
+        finally:
+            torch.set_default_dtype(previous_dtype)
+        features = PromptFeatures(
+            speech_tokens=values[0],
+            speaker_embedding=values[2],
+            mels=values[3],
+            cache_key=cache_key,
+        )
+        if self._prompt_state_cache_enabled:
+            self._store_prompt_entry(cache_key, features, None)
+        else:
+            self._prompt_features[cache_key] = features
+        return features
+
+    def acquire_prompt_owner(
+        self,
+        prompt_cache_id: str,
+        prompt_wav: str,
+        owner: str,
+    ) -> None:
+        if not self._prompt_state_cache_enabled:
+            return
+        cache_key = (prompt_cache_id, prompt_wav)
+        with self._prompt_cache_lock:
+            entry = self._prompt_state_entries.get(cache_key)
+            if entry is not None:
+                entry.owners.add(owner)
+                self._prompt_state_entries.move_to_end(cache_key)
+
+    def release_prompt_owner(
+        self,
+        prompt_cache_id: str,
+        prompt_wav: str,
+        owner: str,
+    ) -> None:
+        if not self._prompt_state_cache_enabled:
+            return
+        with self._prompt_cache_lock:
+            entry = self._prompt_state_entries.get((prompt_cache_id, prompt_wav))
+            if entry is not None:
+                entry.owners.discard(owner)
 
     def evict_prompt(self, prompt_cache_id: str, prompt_wav: str) -> None:
-        """Release request-owned prompt features after stream completion."""
-        self._prompt_features.pop((prompt_cache_id, prompt_wav), None)
+        """Release an inactive runtime prompt while preserving pinned entries."""
+        cache_key = (prompt_cache_id, prompt_wav)
+        if not self._prompt_state_cache_enabled:
+            self._prompt_features.pop(cache_key, None)
+            return
+        with self._prompt_cache_lock:
+            entry = self._prompt_state_entries.get(cache_key)
+            if entry is None or entry.is_default or entry.owners:
+                return
+            self._prompt_state_entries.pop(cache_key)
+            self._prompt_cache_current_bytes -= entry.num_bytes
+            self._prompt_cache_evictions += 1
+        self._emit_prompt_cache_event(
+            "prompt_state_cache_eviction",
+            cache_key=cache_key,
+            details={"reason": "runtime_last_owner_released"},
+        )
 
     @staticmethod
     def _repeat_prompt(features: PromptFeatures, batch_size: int) -> tuple[torch.Tensor, ...]:
@@ -503,7 +750,7 @@ class BatchedToken2Wav(nn.Module):
             "estimator_att_cache": torch.cat((*conditional_att, *unconditional_att), dim=2),
         }
 
-    def setup_batch(
+    def _setup_batch_uncached(
         self,
         features: PromptFeatures,
         batch_size: int,
@@ -559,6 +806,49 @@ class BatchedToken2Wav(nn.Module):
                 },
             )
             for row in split
+        ]
+
+    def setup_batch(
+        self,
+        features: PromptFeatures,
+        batch_size: int,
+    ) -> list[BatchedToken2WavState]:
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        cache_key = features.cache_key
+        if not self._prompt_state_cache_enabled or cache_key is None:
+            return self._setup_batch_uncached(features, batch_size)
+
+        with self._prompt_cache_lock:
+            entry = self._prompt_state_entries.get(cache_key)
+            template = entry.setup_template if entry is not None else None
+            if template is not None:
+                self._prompt_cache_hits += 1
+                self._prompt_state_entries.move_to_end(cache_key)
+            else:
+                self._prompt_cache_misses += 1
+
+        if template is None:
+            # Setup-state caching is intentionally batch-one. The expensive
+            # deterministic template is computed once, then every request row
+            # receives an independent deep clone.
+            template = self._setup_batch_uncached(features, 1)[0]
+            self._store_prompt_entry(cache_key, features, template)
+            self._emit_prompt_cache_event(
+                "prompt_state_cache_miss",
+                cache_key=cache_key,
+            )
+        else:
+            self._emit_prompt_cache_event(
+                "prompt_state_cache_hit",
+                cache_key=cache_key,
+            )
+
+        # A comprehension is required here: list multiplication would alias
+        # every mutable Flow/HiFT tensor across requests.
+        return [
+            self._clone_state_template(template)
+            for _ in range(batch_size)
         ]
 
     @staticmethod

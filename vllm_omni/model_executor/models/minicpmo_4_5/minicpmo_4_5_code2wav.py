@@ -24,6 +24,7 @@ from vllm_omni.benchmarks.ultra_timeline import (
     emit_ultra_timeline_event,
     ultra_timeline_enabled,
 )
+from vllm_omni.config.minicpmo45_fastpath import fastpath_from_vllm_config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .batched_token2wav import (
@@ -194,10 +195,12 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._timeline_pcm_seen: set[tuple[str, int]] = set()
         self._runtime_prompts: dict[str, _RuntimePrompt] = {}
         self._request_prompt_keys: dict[str, str] = {}
+        self._request_backend_prompt_keys: dict[str, tuple[str, str]] = {}
         self._runtime_prompt_dir = tempfile.TemporaryDirectory(
             prefix="minicpmo45-runtime-prompts-",
         )
         extra = self._extra_config()
+        self._fastpath = fastpath_from_vllm_config(vllm_config)
         self._token2wav_n_timesteps, self._token2wav_n_timesteps_source = _resolve_token2wav_n_timesteps(extra)
         self._token2wav_float16, self._token2wav_float16_source = _resolve_token2wav_float16(extra)
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
@@ -337,6 +340,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         )
 
     def _release_request_prompt(self, state_id: str) -> None:
+        backend_key = self._request_backend_prompt_keys.pop(state_id, None)
+        if backend_key is not None and self.backend is not None:
+            self.backend.release_prompt_owner(*backend_key, state_id)
         cache_key = self._request_prompt_keys.pop(state_id, None)
         entry = self._runtime_prompts.get(cache_key) if cache_key is not None else None
         if entry is None:
@@ -351,16 +357,50 @@ class MiniCPMO45Code2Wav(nn.Module):
 
     def _commit_runtime_prompt_owners(self, items: list[_WorkItem]) -> None:
         for item in items:
+            backend_key = (item.prompt_cache_id, item.prompt_wav)
+            previous_backend_key = self._request_backend_prompt_keys.get(
+                item.state_id
+            )
+            if previous_backend_key != backend_key:
+                if previous_backend_key is not None and self.backend is not None:
+                    self.backend.release_prompt_owner(
+                        *previous_backend_key,
+                        item.state_id,
+                    )
+                self._request_backend_prompt_keys.pop(item.state_id, None)
+
             cache_key = item.runtime_prompt_key
-            if cache_key is None:
-                continue
             previous_key = self._request_prompt_keys.get(item.state_id)
             if previous_key != cache_key:
-                self._release_request_prompt(item.state_id)
-            entry = self._runtime_prompts.get(cache_key)
-            if entry is not None:
-                entry.owners.add(item.state_id)
-                self._request_prompt_keys[item.state_id] = cache_key
+                previous_entry = (
+                    self._runtime_prompts.get(previous_key)
+                    if previous_key is not None
+                    else None
+                )
+                if previous_entry is not None:
+                    previous_entry.owners.discard(item.state_id)
+                    if not previous_entry.owners:
+                        if self.backend is not None:
+                            self.backend.evict_prompt(
+                                previous_entry.cache_id,
+                                previous_entry.path,
+                            )
+                        Path(previous_entry.path).unlink(missing_ok=True)
+                        self._runtime_prompts.pop(previous_key, None)
+                self._request_prompt_keys.pop(item.state_id, None)
+            if cache_key is not None:
+                entry = self._runtime_prompts.get(cache_key)
+                if entry is not None:
+                    entry.owners.add(item.state_id)
+                    self._request_prompt_keys[item.state_id] = cache_key
+
+            if previous_backend_key != backend_key:
+                if self.backend is not None:
+                    self.backend.acquire_prompt_owner(
+                        *backend_key,
+                        item.state_id,
+                    )
+                self._request_backend_prompt_keys[item.state_id] = backend_key
 
     def _prune_unowned_runtime_prompts(self) -> None:
         for cache_key, entry in list(self._runtime_prompts.items()):
@@ -937,4 +977,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         self.backend = BatchedToken2Wav(
             token2wav,
             npu_flow_float16=use_npu_flow_autocast,
+            prompt_state_cache=self._fastpath.prompt_state_cache,
+            prompt_cache_max_entries=self._fastpath.prompt_cache_max_entries,
+            prompt_cache_max_bytes=self._fastpath.prompt_cache_max_bytes,
+            default_prompt_key=(
+                self._default_prompt_id,
+                self._default_prompt_wav,
+            ),
         )
