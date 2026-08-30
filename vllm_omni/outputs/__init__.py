@@ -57,6 +57,10 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
     omni_connector_output: OmniConnectorOutput | None = None
+    # Actual number of sequential steps executed for each explicit scheduler
+    # window.  The scheduler uses this to roll back unexecuted reserved steps
+    # after an early terminal token.
+    runner_local_executed_steps: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":

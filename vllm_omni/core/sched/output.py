@@ -98,3 +98,7 @@ class OmniSchedulerOutput(SchedulerOutput):
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
     pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
+    # Explicit contract for runner-local decode.  A request appears here only
+    # when the scheduler has reserved the complete window and advanced engine
+    # accounting by the same amount.
+    runner_local_decode_windows: dict[str, int] = field(default_factory=dict)

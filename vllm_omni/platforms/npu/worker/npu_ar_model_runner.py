@@ -41,6 +41,7 @@ from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, global_stream
 from vllm_ascend.worker.model_runner_v1 import graph_capture
 
+from vllm_omni.config.minicpmo45_fastpath import fastpath_from_vllm_config
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import get_stage_connector_role, stage_sends_async_output
@@ -142,6 +143,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             )
         self._downstream_payload_cache: dict[str, bool] = {}
         self._init_duplex_sampling_state()
+        fastpath = fastpath_from_vllm_config(self.vllm_config)
+        self._runner_local_steps = fastpath.talker_local_steps if fastpath.talker_enabled else 1
+        self._runner_local_tokens_pending: list[list[int]] | None = None
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
@@ -151,6 +155,392 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         self._update_duplex_sampling_states(scheduler_output)
         return deferred_state_corrections_fn
+
+    def _validate_runner_local_window(
+        self,
+        scheduler_output: SchedulerOutput,
+        *,
+        req_ids: list[str],
+        num_reqs: int,
+        num_scheduled_tokens_np: np.ndarray,
+        use_spec_decode: bool,
+        has_encoder_input: bool,
+    ) -> int | None:
+        """Validate the explicit Scheduler→Runner local-decode contract."""
+        windows = dict(
+            getattr(scheduler_output, "runner_local_decode_windows", {}) or {}
+        )
+        if not windows:
+            return None
+        if self._runner_local_steps <= 1:
+            raise RuntimeError("Runner received a local window while the fast path is disabled")
+        if len(windows) != 1 or num_reqs != 1 or len(req_ids) != 1:
+            raise RuntimeError(
+                "Runner-local decode currently supports exactly one request"
+            )
+        req_id = req_ids[0]
+        if set(windows) != {req_id}:
+            raise RuntimeError(
+                f"Runner-local window request IDs {sorted(windows)} do not match batch {req_ids}"
+            )
+        window = int(windows[req_id])
+        if not 2 <= window <= self._runner_local_steps:
+            raise RuntimeError(
+                f"Runner-local window {window} is outside [2, {self._runner_local_steps}]"
+            )
+        if int(num_scheduled_tokens_np[0]) != window:
+            raise RuntimeError(
+                "Runner-local scheduled-token count does not match explicit window"
+            )
+        if self.use_async_scheduling:
+            raise RuntimeError("Runner-local decode requires synchronous scheduling")
+        if use_spec_decode or has_encoder_input or scheduler_output.scheduled_encoder_inputs:
+            raise RuntimeError("Runner-local decode does not support spec/encoder work")
+        if getattr(scheduler_output, "has_structured_output_requests", False):
+            raise RuntimeError("Runner-local decode does not support structured output")
+        if self.broadcast_pp_output or self.pcp_size != 1 or self.dcp_size != 1:
+            raise RuntimeError("Runner-local decode does not support PP broadcast, PCP, or DCP")
+        request_info = self.model_intermediate_buffer.get(req_id, {})
+        if request_info.get("native_duplex") is True:
+            raise RuntimeError("Runner-local decode does not support native duplex requests")
+        num_prompt = getattr(self.input_batch, "num_prompt_tokens", None)
+        if num_prompt is not None:
+            computed = int(self.input_batch.num_computed_tokens_cpu[0])
+            if computed < int(num_prompt[0]):
+                raise RuntimeError("Runner-local decode received a prefill window")
+        return window
+
+    def _runner_local_prebuild_metadata(
+        self,
+        *,
+        req_id: str,
+        window: int,
+    ) -> list[Any]:
+        """Build independent one-token attention metadata for every sub-step."""
+        base_meta, _ = self._build_attention_metadata(
+            num_tokens=1,
+            num_tokens_padded=1,
+            num_reqs=1,
+            num_reqs_padded=1,
+            max_query_len=1,
+            ubatch_slices=None,
+            logits_indices=None,
+            use_spec_decode=False,
+            num_scheduled_tokens={req_id: 1},
+            num_scheduled_tokens_np=np.ones(1, dtype=np.int32),
+        )
+        if not isinstance(base_meta, Mapping) or not base_meta:
+            raise RuntimeError("Runner-local metadata builder returned no layer metadata")
+        base_len = (
+            int(self.optimistic_seq_lens_cpu[0])
+            if hasattr(self, "optimistic_seq_lens_cpu")
+            else int(self.seq_lens[0])
+        )
+        steps: list[Any] = []
+        for offset in range(window):
+            layer_metadata: dict[str, Any] = {}
+            seq_len = base_len + offset
+            for key, metadata in base_meta.items():
+                step_metadata = copy(metadata)
+                seq_lens_list = [seq_len]
+                padding = len(metadata.seq_lens_list) - 1
+                if padding > 0:
+                    seq_lens_list.extend([1] * padding)
+                step_metadata.seq_lens_list = seq_lens_list
+                seq_lens = metadata.seq_lens.new_tensor([seq_len])
+                step_metadata.seq_lens = seq_lens
+                step_metadata.seq_lens_cpu = seq_lens
+                if hasattr(step_metadata, "_seq_lens_cpu"):
+                    step_metadata._seq_lens_cpu = seq_lens
+                if hasattr(step_metadata, "max_seq_len"):
+                    step_metadata.max_seq_len = seq_len
+                layer_metadata[key] = step_metadata
+            steps.append(layer_metadata)
+        return steps
+
+    @staticmethod
+    def _runner_local_prepare_cos(window: int, position: int) -> bool:
+        import vllm_ascend.ops.rotary_embedding as rotary
+
+        if (
+            getattr(rotary, "_cos", None) is None
+            or getattr(rotary, "_sin", None) is None
+            or getattr(rotary, "_cos_sin_cache", None) is None
+        ):
+            return False
+        update_cos_sin(
+            torch.arange(position, position + window, dtype=torch.long)
+        )
+        return True
+
+    @staticmethod
+    def _runner_local_select_cos(step: int) -> None:
+        import vllm_ascend.ops.rotary_embedding as rotary
+
+        rotary._cos[:, :1].copy_(rotary._cos[:, step : step + 1])
+        rotary._sin[:, :1].copy_(rotary._sin[:, step : step + 1])
+
+    def _runner_local_engine_token(self, req_id: str) -> int:
+        """Read the binary continue/stop token from the Talker host state."""
+        info = self.model_intermediate_buffer.get(req_id)
+        if not isinstance(info, dict):
+            raise RuntimeError(f"Missing runner state for local request {req_id!r}")
+        state = info.get("audio_state")
+        if not isinstance(state, dict) or "finished" not in state:
+            raise RuntimeError(
+                f"Missing audio_state.finished for local request {req_id!r}"
+            )
+        return 1 if bool(state["finished"]) else 0
+
+    def _runner_local_step_feedback(self, req_id: str) -> None:
+        """Advance position/KV/input buffers after one completed local step."""
+        current = int(self.input_batch.num_computed_tokens_cpu[0])
+        next_position = current + 1
+        block_size = int(self.cache_config.block_size)
+        block_table = self.input_batch.block_table[0]
+        block_index = next_position // block_size
+        allocated_blocks = int(block_table.num_blocks_per_row[0])
+        if block_index >= allocated_blocks:
+            raise RuntimeError(
+                "Runner-local KV lookahead slot is missing at position "
+                f"{next_position}; scheduler/runner contract is unsafe"
+            )
+        # Block ID zero is a valid vLLM KV block, so allocation must be checked
+        # through num_blocks_per_row rather than treating zero as a sentinel.
+        block_id = int(block_table.block_table.np[0, block_index])
+        slot = block_id * block_size + (next_position % block_size)
+        block_table.slot_mapping.gpu[0].fill_(slot)
+        block_table.slot_mapping.cpu[0] = slot
+
+        self.input_batch.num_computed_tokens_cpu[0] = next_position
+        if hasattr(self, "num_computed_tokens"):
+            self.num_computed_tokens[0].fill_(next_position)
+        self.positions[0].fill_(next_position)
+        self.seq_lens[0].fill_(next_position + 1)
+        if hasattr(self, "optimistic_seq_lens_cpu"):
+            self.optimistic_seq_lens_cpu[0] = next_position + 1
+
+        request_info = self.model_intermediate_buffer.get(req_id)
+        if not isinstance(request_info, dict):
+            raise RuntimeError(f"Missing model intermediate state for {req_id!r}")
+        request_info["request_id"] = req_id
+        _, request_embeds, _ = self.model.preprocess(
+            self.input_ids.gpu[:1],
+            None,
+            **request_info,
+        )
+        if request_embeds is None or request_embeds.numel() == 0:
+            raise RuntimeError(
+                f"Talker feedback produced no codec embedding for {req_id!r}"
+            )
+        self.inputs_embeds.gpu[:1].copy_(request_embeds[:1])
+
+    @staticmethod
+    def _runner_local_collect(
+        multimodal_outputs: Any,
+    ) -> tuple[torch.Tensor, bool]:
+        if not isinstance(multimodal_outputs, Mapping):
+            raise RuntimeError("Runner-local Talker output must be a mapping")
+        codes = multimodal_outputs.get("codes")
+        meta = multimodal_outputs.get("meta")
+        audio = codes.get("audio") if isinstance(codes, Mapping) else None
+        finished = meta.get("finished") if isinstance(meta, Mapping) else None
+        if (
+            not isinstance(audio, (list, tuple))
+            or len(audio) != 1
+            or not isinstance(audio[0], torch.Tensor)
+            or not isinstance(finished, (list, tuple))
+            or len(finished) != 1
+        ):
+            raise RuntimeError("Unexpected Runner-local Talker output shape")
+        return audio[0], bool(finished[0])
+
+    def _replace_runner_local_bookkeeping_tokens(
+        self,
+        *,
+        runner_local_tokens: list[list[int]],
+        valid_sampled_token_ids: list[list[int]],
+        req_ids: list[str],
+        req_id_to_index: dict[str, int],
+    ) -> tuple[list[list[int]], dict[str, int]]:
+        """Replace the final sampled token with the complete local window.
+
+        ``_bookkeeping_sync`` must still run so the normal sampler, RNG and
+        output bookkeeping stay on the K1 path.  It only observes the final
+        sub-step, though, so it appends one token to the persistent runner
+        state.  This method validates that token and atomically rewrites the
+        runner-side token state to contain all E locally executed steps.
+        """
+        if self.use_async_scheduling:
+            raise RuntimeError(
+                "Runner-local bookkeeping requires synchronous scheduling"
+            )
+        if len(runner_local_tokens) != len(req_ids):
+            raise RuntimeError(
+                "Runner-local token rows do not match bookkeeping request rows"
+            )
+
+        replaced: list[list[int]] = []
+        executed_steps: dict[str, int] = {}
+        for req_id in req_ids:
+            req_index = req_id_to_index.get(req_id)
+            if req_index is None or not 0 <= req_index < len(runner_local_tokens):
+                raise RuntimeError(
+                    f"Runner-local request {req_id!r} has no bookkeeping row"
+                )
+            tokens = list(runner_local_tokens[req_index])
+            if not tokens:
+                raise RuntimeError(
+                    f"Runner-local request {req_id!r} executed no steps"
+                )
+            if req_index >= len(valid_sampled_token_ids):
+                raise RuntimeError(
+                    f"Runner-local request {req_id!r} has no sampled token row"
+                )
+            sampled = list(valid_sampled_token_ids[req_index])
+            if sampled != [tokens[-1]]:
+                raise RuntimeError(
+                    "Runner-local final sampler token does not match the final "
+                    f"engine token for request {req_id!r}: {sampled!r} != "
+                    f"{tokens[-1:]!r}"
+                )
+
+            current_end = int(self.input_batch.num_tokens_no_spec[req_index])
+            start = current_end - 1
+            if start < 0:
+                raise RuntimeError(
+                    f"Runner-local request {req_id!r} cannot roll back sampler bookkeeping"
+                )
+            end = start + len(tokens)
+            if end > self.max_model_len:
+                raise RuntimeError(
+                    "Runner-local tokens exceed max_model_len: "
+                    f"{end} > {self.max_model_len}"
+                )
+
+            req_state = self.requests.get(req_id)
+            if req_state is None or not req_state.output_token_ids:
+                raise RuntimeError(
+                    f"Runner-local request {req_id!r} has no cached sampled token"
+                )
+            if req_state.output_token_ids[-1] != tokens[-1]:
+                raise RuntimeError(
+                    "Runner-local cached sampler token does not match the final "
+                    f"engine token for request {req_id!r}"
+                )
+
+            # Roll back the single token appended by _bookkeeping_sync, then
+            # write the complete E-token sequence into every runner-owned view.
+            req_state.output_token_ids.pop()
+            req_state.output_token_ids.extend(tokens)
+            self.input_batch.token_ids_cpu[req_index, start:end] = tokens
+            self.input_batch.is_token_ids[req_index, start:end] = True
+            self.input_batch.num_tokens_no_spec[req_index] = end
+
+            replaced.append(tokens)
+            executed_steps[req_id] = len(tokens)
+
+        return replaced, executed_steps
+
+    def _run_runner_local_window(
+        self,
+        *,
+        req_id: str,
+        window: int,
+        model_kwargs: dict[str, Any],
+    ) -> tuple[torch.Tensor, Any, list[list[int]]]:
+        """Execute ``window`` sequential one-token forwards in one RPC."""
+        _, batch_desc, _, num_tokens_across_dp, _ = (
+            self._determine_batch_execution_and_padding(
+                num_tokens=1,
+                num_reqs=1,
+                num_scheduled_tokens_np=np.ones(1, dtype=np.int32),
+                max_num_scheduled_tokens=1,
+                use_cascade_attn=False,
+                force_eager=False,
+                num_encoder_reqs=0,
+            )
+        )
+        self.query_start_loc.np[0] = 0
+        self.query_start_loc.np[1] = 1
+        self.query_start_loc.np[2:].fill(1)
+        self.query_start_loc.copy_to_gpu()
+
+        first_position = int(self.input_batch.num_computed_tokens_cpu[0])
+        self.positions[0].fill_(first_position)
+        self.seq_lens[0].fill_(first_position + 1)
+        if hasattr(self, "optimistic_seq_lens_cpu"):
+            self.optimistic_seq_lens_cpu[0] = first_position + 1
+
+        metadata_steps = self._runner_local_prebuild_metadata(
+            req_id=req_id,
+            window=window,
+        )
+        cos_prebuilt = self._runner_local_prepare_cos(window, first_position)
+        codec_deltas: list[torch.Tensor] = []
+        terminal_flags: list[bool] = []
+        engine_tokens: list[int] = []
+        hidden_states: torch.Tensor | None = None
+        multimodal_outputs: Any = None
+
+        saved_scheduled = getattr(self, "_omni_num_scheduled_tokens_np", None)
+        self._omni_num_scheduled_tokens_np = np.ones(1, dtype=np.int32)
+        try:
+            for step in range(window):
+                if step:
+                    self._runner_local_step_feedback(req_id)
+                if cos_prebuilt:
+                    self._runner_local_select_cos(step)
+                else:
+                    update_cos_sin(self.positions[:1])
+                with (
+                    record_function_or_nullcontext("runner_local_talker_forward"),
+                    set_ascend_forward_context(
+                        metadata_steps[step],
+                        self.vllm_config,
+                        num_tokens=1,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        aclgraph_runtime_mode=CUDAGraphMode.FULL,
+                        batch_descriptor=batch_desc,
+                        num_actual_tokens=1,
+                        model_instance=self.model,
+                        max_tokens_across_pcp=0,
+                        skip_compiled=False,
+                    ),
+                ):
+                    forward_output = self._model_forward(
+                        1,
+                        input_ids=self.input_ids.gpu[:1],
+                        positions=self.positions[:1],
+                        intermediate_tensors=None,
+                        inputs_embeds=self.inputs_embeds.gpu[:1],
+                        **model_kwargs,
+                    )
+                hidden_states, multimodal_outputs = self.extract_multimodal_outputs(
+                    forward_output
+                )
+                token = self._runner_local_engine_token(req_id)
+                codec_delta, finished = self._runner_local_collect(
+                    multimodal_outputs
+                )
+                codec_deltas.append(codec_delta)
+                terminal_flags.append(finished)
+                engine_tokens.append(token)
+                if finished:
+                    break
+        finally:
+            self._omni_num_scheduled_tokens_np = saved_scheduled
+
+        if hidden_states is None or not isinstance(multimodal_outputs, Mapping):
+            raise RuntimeError("Runner-local window produced no Talker output")
+        merged = dict(multimodal_outputs)
+        merged_codes = dict(merged.get("codes", {}) or {})
+        merged_codes["audio"] = [torch.cat(codec_deltas, dim=0).contiguous()]
+        merged["codes"] = merged_codes
+        merged_meta = dict(merged.get("meta", {}) or {})
+        merged_meta["finished"] = [terminal_flags[-1]]
+        merged["meta"] = merged_meta
+        return hidden_states, merged, [engine_tokens]
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -383,6 +773,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             self._execution_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+        # A failed execute/sample path must never leak a prior local window
+        # into the next request.
+        self._runner_local_tokens_pending = None
 
         #  -------------------------------------- Omni-new -------------------------------------------------
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
@@ -709,6 +1102,15 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # encoder inputs are present. Use eager for the first pass.
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
+        runner_local_window = self._validate_runner_local_window(
+            scheduler_output,
+            req_ids=req_ids[:num_reqs],
+            num_reqs=num_reqs,
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
+            use_spec_decode=use_spec_decode,
+            has_encoder_input=has_encoder_input,
+        )
+        runner_local_tokens: list[list[int]] | None = None
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
@@ -733,9 +1135,15 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 ),
             ) as kv_connector_output,
         ):
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-            )
+            if runner_local_window is None:
+                hidden_states = self._model_forward(
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                )
+            else:
+                # Scheduled rows after the first carry no autoregressive
+                # feedback yet.  Skip that invalid multi-token forward and
+                # let the local loop run sequential one-token graph replays.
+                hidden_states = None
         with record_function_or_nullcontext("post process"):
             #  -------------------------------------- Omni-new -------------------------------------------------
             # [Omni] Map pending ropes metadata to req_ids.
@@ -743,7 +1151,16 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if callable(flush_pending_metadata):
                 flush_pending_metadata(req_ids[:num_reqs])
 
-            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
+            if runner_local_window is None:
+                hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
+            else:
+                hidden_states, multimodal_outputs, runner_local_tokens = (
+                    self._run_runner_local_window(
+                        req_id=req_ids[0],
+                        window=runner_local_window,
+                        model_kwargs=model_kwargs,
+                    )
+                )
 
             if multimodal_outputs is not None:
                 keys_or_type = (
@@ -799,7 +1216,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         self.debugger.step()
                     return output
 
-                sample_hidden_states = hidden_states[logits_indices]
+                effective_logits_indices = logits_indices
+                if runner_local_tokens is not None:
+                    effective_logits_indices = torch.zeros(
+                        1,
+                        dtype=logits_indices.dtype,
+                        device=logits_indices.device,
+                    )
+                sample_hidden_states = hidden_states[effective_logits_indices]
                 #  -------------------------------------- Omni-new -------------------------------------------------
                 # Try with sampling_metadata first; fall back to without for models that don't support it
                 try:
@@ -839,6 +1263,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 logits = broadcasted["logits"]
 
             # Apply structured output bitmasks if present
+            self._runner_local_tokens_pending = runner_local_tokens
             self.execute_model_state = ExecuteModelState(
                 scheduler_output,
                 logits,
@@ -948,6 +1373,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             batch_desc,
             multimodal_outputs, # Omni-Specific
         ) = self.execute_model_state
+        runner_local_tokens = self._runner_local_tokens_pending
+        self._runner_local_tokens_pending = None
         # Clear ephemeral state.
         self.execute_model_state = None
         hidden_seq_len = int(hidden_states.shape[0])
@@ -1026,6 +1453,19 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+
+        runner_local_executed_steps: dict[str, int] = {}
+        if runner_local_tokens is not None:
+            (
+                valid_sampled_token_ids,
+                runner_local_executed_steps,
+            ) = self._replace_runner_local_bookkeeping_tokens(
+                runner_local_tokens=runner_local_tokens,
+                valid_sampled_token_ids=valid_sampled_token_ids,
+                req_ids=req_ids_output_copy,
+                req_id_to_index=req_id_to_index_output_copy,
+            )
+            logprobs_lists = None
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
@@ -1238,6 +1678,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             kv_connector_output=kv_connector_output,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
+            runner_local_executed_steps=runner_local_executed_steps,
         )
         model_runner_output.kv_extracted_req_ids = kv_extracted_req_ids
         model_runner_output.routed_experts = routed_experts_lists

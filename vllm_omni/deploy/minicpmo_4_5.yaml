@@ -98,5 +98,10 @@ platforms:
           cudagraph_mode: PIECEWISE
       - stage_id: 1
         max_num_batched_tokens: 8192
+        # Private provenance marker consumed by stage_config.py. It lets the
+        # NPU fast path replace this repository default while preserving a
+        # user's explicit custom PIECEWISE/FULL setting. The master switch
+        # leaves the original ultra mode untouched.
+        _minicpmo45_graph_mode_scoped_default: true
         compilation_config:
           cudagraph_mode: PIECEWISE

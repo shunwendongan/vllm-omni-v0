@@ -19,6 +19,10 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
+from vllm_omni.config.minicpmo45_fastpath import (
+    MiniCPMO45FastPathConfig,
+    resolve_minicpmo45_fastpath,
+)
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -894,6 +898,13 @@ def merge_pipeline_deploy(
     deploy = _apply_platform_overrides(deploy)
     deploy_by_id = {s.stage_id: s for s in deploy.stages}
 
+    from vllm_omni.platforms import current_omni_platform
+
+    minicpmo45_fastpath = resolve_minicpmo45_fastpath(
+        model_type=pipeline.model_type,
+        is_npu=current_omni_platform.is_npu(),
+    )
+
     # async_chunk is irrelevant for single-stage pipelines, so we always disable it
     if len(pipeline.stages) <= 1:
         deploy.async_chunk = False
@@ -927,6 +938,20 @@ def merge_pipeline_deploy(
         stage_type, worker_type = _resolve_execution_mode(ps.execution_type)
         input_proc, next_stage_proc = _select_processor_funcs(ps, deploy.async_chunk)
         engine_args = _build_engine_args(ps, ds, pipeline, deploy, next_stage_proc)
+        additional_config = dict(engine_args.get("additional_config") or {})
+        deploy_fastpath = additional_config.get("minicpmo45_fastpath")
+        stage_fastpath = minicpmo45_fastpath.with_deploy_overrides(
+            deploy_fastpath,
+        ).for_stage(ps.stage_id)
+        if pipeline.model_type == "minicpmo_4_5":
+            stage_fastpath = _apply_minicpmo45_engine_defaults(
+                ps=ps,
+                ds=ds,
+                engine_args=engine_args,
+                fastpath=stage_fastpath,
+            )
+            additional_config["minicpmo45_fastpath"] = stage_fastpath.to_stage_dict(ps.stage_id)
+            engine_args["additional_config"] = additional_config
         # Downstream stages may share a multimodal wrapper class without owning
         # an encoder. Do not make vLLM profile dummy multimodal inputs for them.
         if not ps.requires_multimodal_data:
@@ -967,6 +992,89 @@ def merge_pipeline_deploy(
             )
         )
     return result
+
+
+def _apply_minicpmo45_engine_defaults(
+    *,
+    ps: StagePipelineConfig,
+    ds: StageDeployConfig | None,
+    engine_args: dict[str, Any],
+    fastpath: MiniCPMO45FastPathConfig,
+) -> MiniCPMO45FastPathConfig:
+    """Apply NPU defaults while preserving incompatible explicit settings.
+
+    The resolved (possibly disabled) stage view is embedded into
+    ``additional_config`` and consumed unchanged by the scheduler and runner.
+    This is the single source of truth for K.
+    """
+
+    # The repository's default NPU deploy advertises the old PIECEWISE mode
+    # with this private marker.  It is an NPU-scoped baseline default rather
+    # than a user override: the fast path may replace it, while a custom
+    # deploy that explicitly requests PIECEWISE remains authoritative.  The
+    # marker is consumed here and never reaches vLLM EngineArgs.
+    graph_mode_is_scoped_default = bool(
+        engine_args.pop("_minicpmo45_graph_mode_scoped_default", False)
+    )
+
+    if not fastpath.enabled:
+        return fastpath
+
+    async_explicit = ds is not None and ds.async_scheduling is not None
+
+    if ps.stage_id == 0 and fastpath.ngram_enabled:
+        if "speculative_config" in engine_args:
+            if fastpath.ngram_tokens_explicit:
+                raise ValueError(
+                    "VLLM_OMNI_MINICPMO45_NGRAM_SPEC_TOKENS conflicts with an "
+                    "explicit Stage0 speculative_config"
+                )
+            return dataclasses.replace(fastpath, ngram_spec_tokens=0)
+        if async_explicit and bool(engine_args.get("async_scheduling")):
+            if fastpath.ngram_tokens_explicit:
+                raise ValueError(
+                    "Stage0 ngram fast path requires async_scheduling=false"
+                )
+            return dataclasses.replace(fastpath, ngram_spec_tokens=0)
+        engine_args["async_scheduling"] = False
+        k = fastpath.ngram_spec_tokens
+        engine_args["speculative_config"] = {
+            "method": "ngram",
+            "num_speculative_tokens": k,
+            "prompt_lookup_min": 1,
+            "prompt_lookup_max": max(10, k),
+        }
+        return fastpath
+
+    if ps.stage_id == 1 and fastpath.talker_enabled:
+        if async_explicit and bool(engine_args.get("async_scheduling")):
+            if fastpath.talker_steps_explicit:
+                raise ValueError(
+                    "Stage1 runner-local decode requires async_scheduling=false"
+                )
+            return dataclasses.replace(fastpath, talker_local_steps=1)
+
+        compilation = dict(engine_args.get("compilation_config") or {})
+        mode = compilation.get("cudagraph_mode")
+        normalized_mode = None if mode is None else str(mode).split(".")[-1].upper()
+        if (
+            normalized_mode not in (None, "FULL_DECODE_ONLY")
+            and not graph_mode_is_scoped_default
+        ):
+            if fastpath.talker_steps_explicit:
+                raise ValueError(
+                    "Stage1 runner-local decode requires cudagraph_mode="
+                    f"FULL_DECODE_ONLY, got {mode!r}"
+                )
+            return dataclasses.replace(fastpath, talker_local_steps=1)
+
+        engine_args["async_scheduling"] = False
+        compilation["cudagraph_mode"] = "FULL_DECODE_ONLY"
+        compilation.setdefault("cudagraph_capture_sizes", [1])
+        engine_args["compilation_config"] = compilation
+        return fastpath
+
+    return fastpath
 
 
 @dataclass

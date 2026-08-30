@@ -19,6 +19,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.config.minicpmo45_fastpath import fastpath_from_vllm_config
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
@@ -43,6 +44,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        fastpath = fastpath_from_vllm_config(self.vllm_config)
+        self._runner_local_steps = fastpath.talker_local_steps if fastpath.talker_enabled else 1
+        if self._runner_local_steps > 1:
+            # Reserve the complete local window before the runner writes any
+            # KV rows.  This is the official vLLM lookahead allocation
+            # contract and keeps windows safe across a block boundary.
+            self.num_lookahead_tokens = max(
+                int(getattr(self, "num_lookahead_tokens", 0)),
+                self._runner_local_steps - 1,
+            )
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
@@ -80,6 +91,96 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+
+    @staticmethod
+    def _request_is_duplex(request: Request) -> bool:
+        payload = getattr(request, "additional_information", None)
+        if payload is None:
+            return False
+        info = deserialize_additional_information(payload)
+        meta = info.get("meta") if isinstance(info, dict) else None
+        return bool(
+            isinstance(info, dict)
+            and (
+                info.get("native_duplex") is True
+                or (isinstance(meta, dict) and meta.get("native_duplex") is True)
+            )
+        )
+
+    def _expand_runner_local_window(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> dict[str, int]:
+        """Expand one safe Stage1 decode token into an explicit local window."""
+        k = self._runner_local_steps
+        if k <= 1 or self.is_encoder_decoder:
+            return {}
+        scheduled = scheduler_output.num_scheduled_tokens
+        if len(scheduled) != 1 or scheduler_output.total_num_scheduled_tokens != 1:
+            return {}
+        req_id, scheduled_tokens = next(iter(scheduled.items()))
+        if scheduled_tokens != 1:
+            return {}
+        request = self.requests.get(req_id)
+        if request is None or request.is_finished() or request.is_prefill_chunk:
+            return {}
+        if request.has_encoder_inputs or self._request_is_duplex(request):
+            return {}
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return {}
+        if scheduler_output.scheduled_encoder_inputs:
+            return {}
+        if getattr(scheduler_output, "has_structured_output_requests", False):
+            return {}
+
+        computed_before = int(request.num_computed_tokens) - 1
+        max_model_len = int(getattr(self, "max_model_len", computed_before + k))
+        sampling_params = request.sampling_params
+        max_output_tokens = int(getattr(sampling_params, "max_tokens", 0) or 0)
+        output_limit = int(request.num_prompt_tokens) + max_output_tokens
+        absolute_limit = min(max_model_len, output_limit) if max_output_tokens > 0 else max_model_len
+        window = min(k, max(0, absolute_limit - computed_before))
+        if window <= 1:
+            return {}
+
+        scheduled[req_id] = window
+        scheduler_output.total_num_scheduled_tokens += window - 1
+        # Upstream already advanced by the original single scheduled token.
+        request.num_computed_tokens += window - 1
+        return {req_id: window}
+
+    @staticmethod
+    def _validate_runner_local_result(
+        *,
+        planned_steps: dict[str, int],
+        executed_steps: dict[str, int],
+        sampled_token_ids: list[list[int]],
+        req_id_to_index: dict[str, int],
+    ) -> None:
+        if set(planned_steps) != set(executed_steps):
+            raise RuntimeError(
+                "Runner-local decode contract mismatch: planned request IDs "
+                f"{sorted(planned_steps)} != executed request IDs "
+                f"{sorted(executed_steps)}"
+            )
+        for req_id, planned in planned_steps.items():
+            executed = executed_steps[req_id]
+            if not 1 <= executed <= planned:
+                raise RuntimeError(
+                    f"Runner-local decode request {req_id!r} executed {executed} "
+                    f"steps for a planned window of {planned}"
+                )
+            req_index = req_id_to_index.get(req_id)
+            if req_index is None or req_index >= len(sampled_token_ids):
+                raise RuntimeError(
+                    f"Runner-local decode request {req_id!r} is missing sampled tokens"
+                )
+            if len(sampled_token_ids[req_index]) != executed:
+                raise RuntimeError(
+                    f"Runner-local decode request {req_id!r} returned "
+                    f"{len(sampled_token_ids[req_index])} tokens for "
+                    f"{executed} executed steps"
+                )
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -234,6 +335,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 )
             if self.input_coordinator:
                 self.input_coordinator.restore_queues(self.waiting)
+        runner_local_windows = self._expand_runner_local_window(scheduler_output)
         try:
             # Late import to avoid circulars in some launch modes
             from .output import OmniNewRequestData
@@ -279,6 +381,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return self._wrap_omni_scheduler_output(
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
+            runner_local_decode_windows=runner_local_windows,
         )
 
     def update_from_output(
@@ -296,6 +399,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
+        planned_local_steps = dict(
+            getattr(scheduler_output, "runner_local_decode_windows", {}) or {}
+        )
+        executed_local_steps = dict(
+            getattr(model_runner_output, "runner_local_executed_steps", {}) or {}
+        )
+        self._validate_runner_local_result(
+            planned_steps=planned_local_steps,
+            executed_steps=executed_local_steps,
+            sampled_token_ids=sampled_token_ids or [],
+            req_id_to_index=model_runner_output.req_id_to_index,
+        )
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -353,6 +468,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
+
+            planned = planned_local_steps.get(req_id)
+            if planned is not None:
+                unexecuted = planned - executed_local_steps[req_id]
+                if unexecuted:
+                    request.num_computed_tokens -= unexecuted
+                    if request.num_output_placeholders:
+                        request.num_output_placeholders = max(
+                            0,
+                            request.num_output_placeholders - unexecuted,
+                        )
 
             scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             if scheduled_spec_token_ids and generated_token_ids:

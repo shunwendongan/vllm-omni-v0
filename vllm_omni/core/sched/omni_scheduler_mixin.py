@@ -164,6 +164,7 @@ class OmniSchedulerMixin:
         *,
         finished_requests_needing_kv_transfer: dict | None = None,
         pending_input_registrations: list[OmniChunkRecvHandle] | None = None,
+        runner_local_decode_windows: dict[str, int] | None = None,
     ) -> OmniSchedulerOutput:
         """Wrap a base ``SchedulerOutput`` in ``OmniSchedulerOutput``.
 
@@ -179,6 +180,7 @@ class OmniSchedulerMixin:
             **base_data,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
             pending_input_registrations=pending_input_registrations,
+            runner_local_decode_windows=runner_local_decode_windows or {},
         )
 
     def make_stats(self, *args, **kwargs) -> SchedulerStats | None:
