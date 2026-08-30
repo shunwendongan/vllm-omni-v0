@@ -252,6 +252,10 @@ outputs/
 results/
 generated/
 output_*/
+# Submission metadata and reviewed summaries are intentionally versioned.
+!submission/ultra/configs/*.json
+!submission/ultra/results/
+!submission/ultra/results/*.json
 # Local performance evidence and the default opt-in Ultra timeline sink.
 work/perf-evidence/
 ultra-timeline/

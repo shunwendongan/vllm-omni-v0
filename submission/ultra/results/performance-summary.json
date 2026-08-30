@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "candidate": "ultra",
+  "candidate_code_base_commit": "687af3ad5c66425ab77072cd4964164192897579",
+  "hardware": "single Atlas A2 / Ascend 910B3 NPU",
+  "status": "EVIDENCE_PENDING_UPLOAD",
+  "workload": {
+    "dataset": "Seed-TTS zh",
+    "num_prompts": 32,
+    "max_concurrency": 1,
+    "warmups": 2,
+    "formal_runs": 3
+  },
+  "reported_best_run": {
+    "mean_audio_rtf": 0.56,
+    "mean_audio_ttfp_ms": 607.11,
+    "mean_ttft_ms": 376.17,
+    "mean_e2el_ms": 2325.52,
+    "source_path": "/workspace/vllm-competition/results/ultra/performance/seedtts-c1-32x3/20260830-123645/summary.json"
+  },
+  "all_rounds": null,
+  "guardrails": null,
+  "matched_slow_a2": null,
+  "official_a3_reference": {
+    "mean_audio_rtf": 0.4423,
+    "mean_audio_ttfp_ms": 986.4666,
+    "mean_ttft_ms": 333.2633,
+    "cross_hardware_only": true
+  },
+  "note": "The reported best run is a measured A2 fact supplied by the team, but raw JSON and all-round distributions must be collected before readiness."
+}

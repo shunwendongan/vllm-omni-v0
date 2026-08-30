@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "candidate": "ultra",
+  "candidate_code_base_commit": "687af3ad5c66425ab77072cd4964164192897579",
+  "status": "NOT_VERIFIED",
+  "standard_demo": "examples/online_serving/minicpmo/gradio_demo.py",
+  "required_modalities": ["text", "image", "audio", "video"],
+  "interaction_count": 0,
+  "audio_contract": {
+    "sample_rate_hz": 24000,
+    "channels": 1,
+    "nonempty_and_decodable": false
+  },
+  "recording": null,
+  "service_stable": false
+}

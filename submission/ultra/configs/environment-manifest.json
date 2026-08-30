@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "team": "shunwendongan",
+  "candidate": {
+    "label": "ultra",
+    "code_base_commit": "687af3ad5c66425ab77072cd4964164192897579",
+    "submission_branch": "submission/ultra-20260830"
+  },
+  "official_contract": {
+    "repository": "https://github.com/vllm-project/vllm-omni.git",
+    "branch": "minicpm-challenge",
+    "commit": "ecd9d99da0c124331861890e0371e66a01cddaa5",
+    "container": "quay.io/ascend/vllm-omni:v0.25.0-a3",
+    "hardware": "single Atlas A3 / Ascend 910C NPU",
+    "model": "OpenBMB/MiniCPM-o-4_5"
+  },
+  "local_environment": {
+    "hardware": "single Atlas A2 / Ascend 910B3 NPU",
+    "status": "REMOTE_MANIFEST_PENDING",
+    "versions": "COLLECT_AT_RUNTIME"
+  },
+  "quality_gates": {
+    "daily_omni_accuracy_min": 0.775,
+    "videomme_accuracy_min": 0.67,
+    "seed_tts_wer_max": 0.0156,
+    "seed_tts_asv_sim_min": 0.689
+  },
+  "status": "NOT_READY",
+  "note": "A3/910C official reproduction pending; A2 metrics are not converted to A3."
+}

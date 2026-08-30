@@ -1,0 +1,6 @@
+repository=https://github.com/vllm-project/vllm-omni.git
+branch=minicpm-challenge
+commit=ecd9d99da0c124331861890e0371e66a01cddaa5
+checked_at=2026-08-31T00:00:00+08:00
+deploy_config_sha256=b3c35aad87ddeba64781b3833b64c4a7132eaf88fc29002bb018e6b84fdb76ed
+performance_config_sha256=01ace1ad6e06823be75b97d85cede0a5542c097c7493a9a06a77537128aff1d2
