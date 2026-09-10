@@ -1,268 +1,85 @@
-# MiniCPM-o 4.5 Ascend NPU Inference Optimization
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/logos/vllm-omni-logo.png">
+    <img alt="vllm-omni" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/logos/vllm-omni-logo.png" width=55%>
+  </picture>
+</p>
+<h3 align="center">
+Easy, fast, and cheap omni-modality model serving for everyone
+</h3>
 
-This branch is a focused vLLM-Omni optimization stack for MiniCPM-o 4.5 on
-Ascend NPU. It keeps the original Thinker-Talker-Code2Wav serving topology and
-targets the runtime hot path that decides TTFT, TTFP, E2E latency, and audio
-RTF.
+<p align="center">
+| <a href="https://vllm-omni.readthedocs.io/en/latest/"><b>Documentation</b></a> | <a href="https://deepwiki.com/vllm-project/vllm-omni"><b>DeepWiki</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> | <a href="docs/assets/WeChat.jpg"><b>WeChat</b></a> | <a href="https://arxiv.org/abs/2602.02204"><b>Paper</b></a> | <a href="https://docs.google.com/presentation/d/111-L8zF7A1j_YI_cR8JsblofdScdRr2f/edit?usp=sharing&ouid=110473603432222024453&rtpof=true&sd=true"><b>Slides</b></a> |
+</p>
 
-The implementation is based on vLLM-Omni and specializes the MiniCPM-o 4.5
-full-modality pipeline for an Ascend 910C / Atlas A3 style environment. The
-main work is in graph execution, autoregressive scheduling, cross-stage tensor
-handoff, and streaming audio generation.
 
-## Branch Scope
+---
 
-| Item | Value |
-|---|---|
-| Branch | `vllm-omni-v0-max_others` |
-| Optimization evidence commit | `ea66d2d2f3aba0adc021046860423273dde249d7` |
-| Target model | MiniCPM-o 4.5 |
-| Main deploy config | `vllm_omni/deploy/minicpmo_4_5.yaml` |
-| Target pipeline | Stage 0 Thinker -> Stage 1 Talker -> Stage 2 Code2Wav |
-| Target backend | Ascend NPU through torch-npu / vLLM-Ascend / CANN |
+*Latest News* 🔥
+- [2026/07] We released [0.24.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.24.0) - aligned with the vLLM 0.24 release line, expanding production-ready coverage across TTS, speech, diffusion, image/video generation, and robot-policy serving, with major Omni stage runtime refactoring, diffusion request-level batching, async output materialization, quantization/cache/memory improvements, and broad CUDA/ROCm/XPU/NPU support.
+- [2026/06] We released [0.22.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.22.0) - an **omnimodal world-model** release aligned with vLLM 0.22, featuring [Nvidia Cosmos3](recipes/cosmos3/Cosmos3-Nano.md)/DreamZero world model support, expanded quantization coverage across Blackwell/NPU/XPU, TTS production improvements, new models including MiniCPM-o 4.5, MOSS-TTS, and Lance, plus RL integration with [VeRL-Omni](https://github.com/verl-project/verl-omni).
+- [2026/05] We released [0.20.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.20.0) - refreshes the serving/runtime stack for large-scale omni workloads, and improves diffusion model performance, quantization, and hardware readiness across CUDA, ROCm, MUSA, NPU, and XPU backends.
+- [2026/03] We released [0.18.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.18.0) - strengthens the core runtime through a large entrypoint refactor and scheduler/runtime cleanups, expands unified quantization and diffusion execution, broadens multimodal model coverage, and improves production readiness across audio, omni, image, video, RL, and multi-platform deployments.
+- [2026/03] Check out our first public [project deepdive](https://youtu.be/sgwNfsNnR9I) at the vLLM Hong Kong Meetup!
+- [2026/03] **[vllm-omni-skills](https://github.com/hsliuustc0106/vllm-omni-skills)** is a community-driven collection of AI assistant skills that help developers work with vLLM-Omni more effectively. These skills can be used with popular agentic AI coding assistants like **Cursor IDE**, **Claude**, **Codex**, and more.
+- [2026/02] We released [0.16.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.16.0) - A major alignment + capability release that rebases onto **upstream vLLM v0.16.0** and significantly expands performance, distributed execution, and production readiness across **Qwen3-Omni / Qwen3-TTS**, **Bagel**, **MiMo-Audio**, **GLM-Image** and the **Diffusion (DiT) image/video stack**—while also improving platform coverage (CUDA / ROCm / NPU / XPU), CI quality, and documentation.
+- [2026/02] We released [0.14.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.14.0) - This is the first **stable release** of vLLM-Omni that expands Omni’s diffusion / image-video generation and audio / TTS stack, improves distributed execution and memory efficiency, and broadens platform/backend coverage (GPU/ROCm/NPU/XPU). It also brings meaningful upgrades to serving APIs, profiling & benchmarking, and overall stability. Please check our latest [paper](https://arxiv.org/abs/2602.02204) for architecture design and performance results.
+- [2025/11] vLLM community officially released [vllm-project/vllm-omni](https://github.com/vllm-project/vllm-omni) in order to support omni-modality models serving.
 
-This README describes the optimization branch, not the upstream vLLM-Omni
-project in general. Upstream documentation remains the best reference for the
-base framework APIs and supported model families.
+---
 
-## Performance Summary
+## About
 
-The final-stack numbers below are historical same-metric results kept in the
-branch history. They are cumulative results from multiple optimizations and
-must not be attributed to one single change.
+[vLLM](https://github.com/vllm-project/vllm) was originally designed to support large language models for text-based autoregressive generation tasks. vLLM-Omni is a framework that extends its support for omni-modality model inference and serving:
 
-| Seed-TTS concurrency | Official baseline RTF | Optimized RTF | RTF reduction |
-|---:|---:|---:|---:|
-| 1 | 0.4423 | 0.3047 | 31.1% |
-| 4 | 1.5734 | 0.4427 | 71.9% |
-| 8 | 2.3024 | 0.6298 | 72.6% |
+- **Omni-modality**: Text, image, audio, video, and action data processing
+- **Non-autoregressive Architectures**: extend the AR support of vLLM to Diffusion Transformers (DiT) and other parallel generation models
+- **Heterogeneous outputs**: from traditional text generation to multimodal and action outputs
 
-For concurrency 1, first-response latency improved from:
+<p align="center">
+  <picture>
+    <img alt="vllm-omni" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/omni-modality-model-architecture.png" width=55%>
+  </picture>
+</p>
 
-| Metric | Official baseline | Optimized | Reduction |
-|---|---:|---:|---:|
-| TTFT | 333.27 ms | 257.8 ms | 22.6% |
-| TTFP | 986.47 ms | 364.0 ms | 63.1% |
+vLLM-Omni is fast with:
 
-Quality and guardrail records in the branch history include:
+- State-of-the-art AR support by leveraging efficient KV cache management from vLLM
+- Pipelined stage execution overlapping for high throughput performance
+- Fully disaggregation based on OmniConnector and dynamic resource allocation across stages
 
-- K14 n-gram speculative decoding and K12 runner-local decode: WER and SIM
-  unchanged in the recorded A/B runs.
-- H1 EOS early termination: downstream audio remained bitwise identical while
-  Stage 0 output tokens dropped from 435 to 403 in the recorded run.
-- TJS1 pseudo-1step CFM: full zh2020 gate passed with WER 1.03% and SIM 0.8381
-  against the recorded gates WER <= 1.56% and SIM >= 0.689.
-- Historical full-task checks recorded Daily-Omni 78.09% and Video-MME 69.59%,
-  both above the corresponding admission thresholds in the preserved report.
+vLLM-Omni is flexible and easy to use with:
 
-## Optimization Stack
+- Heterogeneous pipeline abstraction to manage complex model workflows
+- Seamless integration with popular Hugging Face models
+- Tensor, pipeline, data and expert parallelism support for distributed inference
+- Streaming outputs
+- OpenAI-compatible API server
 
-### 1. Decode Graph Defaults
+vLLM-Omni seamlessly supports most popular open-source models on HuggingFace, including:
 
-Auto-regressive stages are forced to `FULL_DECODE_ONLY` graph mode with
-stage-specific capture buckets. Stage 0 uses larger buckets for Thinker decode,
-while Stage 1 uses smaller Talker buckets. The same configuration path also
-enables Ascend static-kernel support when the backend provides it.
+- **Omni-modality models** (e.g. Qwen3-Omni, Cosmos3, HunyuanImage, BAGEL)
+- **TTS models** (e.g. Qwen3-TTS, VoxCPM2, Ming-Omni-TTS, CosyVoice3)
+- **Diffusion models** — image, video, and audio generation (e.g. Qwen-Image, Wan2.2, FLUX)
+- **Robot-policy and action models** (e.g. GR00T-N1.7, DreamZero-DROID, InternVLA-A1, Cosmos3 action policy)
 
-Relevant code:
+## Getting Started
 
-- `vllm_omni/config/stage_config.py`
-- `vllm_omni/platforms/npu/graph_tools.py`
+Visit our [documentation](https://vllm-omni.readthedocs.io/en/latest/) to learn more.
 
-### 2. Stage 0 K14 n-gram Speculative Decoding
+- [Installation](https://vllm-omni.readthedocs.io/en/latest/getting_started/installation/)
+- [Quickstart](https://vllm-omni.readthedocs.io/en/latest/getting_started/quickstart/)
+- [List of Supported Models](https://vllm-omni.readthedocs.io/en/latest/models/supported_models/)
+- [Deployment Recipes](https://recipes.vllm.ai) for vLLM-Omni model serving
 
-Stage 0 defaults to n-gram speculative decoding when the official deploy config
-does not provide its own `speculative_config`. The current default reads
-`OMNI_TALKER_S0SPEC_K`, falling back to `14`.
+## Contributing
 
-The recorded A/B compared K10 and K14:
-
-| Change | Recorded effect |
-|---|---|
-| K10 -> K14 | E2E latency -10.0 ms, RTF -0.0027 |
-| K14 guardrail | WER/SIM unchanged |
-| K15 result | No-go due to extra verification cost and WER regression |
-
-This is prompt/context lookup based speculation. It does not use a separate
-draft model and it does not mean 14 final tokens are generated in parallel.
-
-### 3. H1 EOS Early Termination
-
-Stage 0 injects MiniCPM-o specific stop tokens for the TTS path:
-
-- `151704`: TTS EOS
-- `151645`: IM END
-
-The Talker/Code2Wav path slices the TTS segment by BOS/EOS, so decoding beyond
-that boundary is downstream-unused tail work. Stopping there reduced the
-recorded E2E latency by 31.5 ms and kept downstream audio bitwise identical.
-
-Rollback:
-
-```bash
-export OMNI_TALKER_H1_STOP=0
-```
-
-### 4. Stage 1 K12 Runner-local Multi-step Decode
-
-The Talker stage runs multiple sequential one-token decode steps inside one
-runner round trip when the batch is eligible. This does not make the
-autoregressive dependency parallel. It amortizes Scheduler -> IPC -> Runner ->
-output -> Scheduler overhead across a local K-token window.
-
-The branch default is K12 in both the scheduler accounting path and the runner
-path. The recorded sandwich A/B for K8 -> K12 showed 12.5 ms E2E latency
-reduction with WER/SIM unchanged.
-
-Useful knobs:
-
-```bash
-export OMNI_TALKER_SCHED_K=12
-export OMNI_TALKER_LOCAL_STEPS=12
-export OMNI_TALKER_LOCAL_DECODE=1
-```
-
-Disable local decode:
-
-```bash
-export OMNI_TALKER_LOCAL_DECODE=0
-```
-
-### 5. Tagged Raw-bytes Stage Handoff
-
-The Stage 0 -> Stage 1 tensor handoff replaces nested Python list serialization
-with a tagged raw-bytes payload carrying dtype, shape, and contiguous tensor
-bytes.
-
-Old path:
-
-```text
-Tensor -> CPU -> nested Python list -> msgpack
-```
-
-Optimized path:
-
-```text
-Tensor -> CPU contiguous bytes + dtype + shape -> receiver reconstructs Tensor
-```
-
-The recorded A/B showed E2E latency -14.1 ms and RTF -0.0032. This is not
-zero-copy: the sender still materializes CPU bytes and the receiver still
-reconstructs a tensor.
-
-Rollback:
-
-```bash
-export VLLM_OMNI_HANDOFF_LIST_LEGACY=1
-```
-
-### 6. Code2Wav Exact-signature NPU Graph
-
-Stage 2 defaults enable bounded NPU Graph acceleration for Code2Wav and HiFT:
-
-```text
-code2wav_enable_npu_graph = true
-enable_hift_npu_graph = true
-code2wav_max_npu_graphs = 48
-hift_npu_graph_max_graphs = 8
-```
-
-The graph runner keys captures by operation constants plus input shape, dtype,
-and device. New signatures run eager when the graph budget is exhausted. A
-capture failure is treated as a stage-level failure instead of a silent
-fallback, because graph capture state can poison the worker.
-
-### 7. TJS1 pseudo-1step CFM
-
-`OMNI_TJS_STOP=1` activates the pseudo-1step CFM path for Code2Wav. This is an
-algorithmic approximation rather than a bitwise-equivalent runtime optimization,
-so it is only valid together with quality gates.
-
-Recorded result:
-
-| Change | Recorded effect |
-|---|---|
-| pseudo-2step -> pseudo-1step | E2E latency -12 ms |
-| zh2020 quality gate | WER 1.03%, SIM 0.8381 |
-
-Set the mode explicitly:
-
-```bash
-export OMNI_TJS_STOP=1
-```
-
-## Code Map
-
-| Area | Files |
-|---|---|
-| Stage config, Graph defaults, H1, K14, Stage 2 graph toggles | `vllm_omni/config/stage_config.py` |
-| Runner-local K-window scheduling | `vllm_omni/core/sched/omni_ar_scheduler.py` |
-| NPU Talker runner local decode | `vllm_omni/platforms/npu/worker/npu_ar_model_runner.py` |
-| Tagged raw-bytes sender | `vllm_omni/model_executor/stage_input_processors/minicpmo_4_5_omni.py` |
-| Tagged raw-bytes receiver | `vllm_omni/experimental/fullduplex/engine/intermediate.py` |
-| Exact-signature NPU Graph cache | `vllm_omni/platforms/npu/graph_tools.py` |
-| Code2Wav / CFM path | `vllm_omni/model_executor/models/minicpmo_4_5/batched_token2wav.py` |
-
-## Run
-
-Install the project with the same Python and backend stack required by
-vLLM-Omni, vLLM-Ascend, torch-npu, and CANN for the target machine.
-
-```bash
-git clone -b vllm-omni-v0-max_others https://github.com/shunwendongan/vllm-omni-v0.git
-cd vllm-omni-v0
-pip install -e .
-```
-
-Start MiniCPM-o 4.5 serving with the optimized deploy config:
-
-```bash
-export HF_HUB_OFFLINE=1
-export OMNI_TALKER_S0SPEC_K=14
-export OMNI_TALKER_SCHED_K=12
-export OMNI_TALKER_LOCAL_STEPS=12
-export OMNI_TJS_STOP=1
-
-vllm serve /path/to/MiniCPM-o-4_5 \
-  --omni \
-  --port 8091 \
-  --deploy-config vllm_omni/deploy/minicpmo_4_5.yaml
-```
-
-For benchmark work, record the exact model path, commit, deploy config,
-hardware, concurrency, prompt set, warmup policy, and quality gates. The
-numbers above come from preserved branch evidence and commit messages; rerun
-the workload on the target Ascend server before reporting fresh performance.
-
-## Evidence Boundaries
-
-- Final-stack RTF and first-packet numbers are cumulative. They combine graph,
-  scheduling, cache, prewarm, and device-side changes.
-- H1, K14, K12, T44, and TJS1 have separate recorded A/B evidence. Their
-  latencies should not be added together as one total improvement.
-- `enable_static_kernel` enables backend capability. It is not a user-authored
-  Ascend C device kernel.
-- Tagged raw-bytes handoff reduces Python object materialization. It is not
-  shared-memory zero-copy.
-- TJS1 changes CFM solver-step semantics, so it must be discussed with WER/SIM
-  quality gates.
-
-## Upstream
-
-This repository is a fork and optimization branch of
-[vLLM-Omni](https://github.com/vllm-project/vllm-omni), which extends vLLM for
-omni-modality model inference and serving across text, image, audio, video, and
-diffusion workloads.
-
-Refer to upstream resources for general usage:
-
-- [Documentation](https://vllm-omni.readthedocs.io/en/latest/)
-- [Supported models](https://vllm-omni.readthedocs.io/en/latest/models/supported_models/)
-- [vLLM project](https://github.com/vllm-project/vllm)
+We welcome and value any contributions and collaborations.
+Please check out [Contributing to vLLM-Omni](https://vllm-omni.readthedocs.io/en/latest/contributing/) for how to get involved.
 
 ## Citation
 
-If you use vLLM-Omni for research, cite the upstream paper:
+If you use vLLM-Omni for your research, please cite our [paper](https://arxiv.org/abs/2602.02204):
 
 ```bibtex
 @article{yin2026vllmomni,
@@ -272,6 +89,13 @@ If you use vLLM-Omni for research, cite the upstream paper:
   year={2026}
 }
 ```
+
+## Join the Community
+Feel free to ask questions, provide feedbacks and discuss with fellow users of vLLM-Omni in `#sig-omni` slack channel at [slack.vllm.ai](https://slack.vllm.ai) or vLLM user forum at [discuss.vllm.ai](https://discuss.vllm.ai).
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=vllm-project/vllm-omni&type=date&legend=top-left)](https://www.star-history.com/#vllm-project/vllm-omni&type=date&legend=top-left)
 
 ## License
 
