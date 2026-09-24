@@ -113,6 +113,9 @@ CLI/runtime values retain their existing precedence. A first-class backend
 field wins over the same `engine_extras` key, with a warning on conflict;
 extras-only configurations remain supported. Existing backend fallback rules
 are unchanged, and this PR does not claim support for unvalidated platforms.
+In vLLM 0.29, unquantized ROCm GEMM dispatch does not consult `linear_backend`;
+NPU plugin behavior is not validated here. Plain `torch.nn.Linear` layers do
+not consume vLLM's kernel configuration.
 
 An offline CUDA component smoke test runs a tiny, randomly initialized native
 FLUX transformer, checks the actual linear callable and SDPA implementation,

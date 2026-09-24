@@ -531,7 +531,7 @@ class StageDeployConfig:
         # Only backend selections gain this precedence rule; unrelated extras
         # keep their existing merge behavior. Never mutate caller-owned input.
         self.engine_extras = dict(self.engine_extras)
-        for name in ("attention_backend", "diffusion_attention_backend", "moe_backend", "linear_backend"):
+        for name in ("attention_backend", "moe_backend", "linear_backend"):
             value = getattr(self, name)
             if value is not None and name in self.engine_extras:
                 extra = self.engine_extras.pop(name)
@@ -933,6 +933,10 @@ def _apply_platform_overrides(
                 base.env = po.env
         for key, val in po.overrides.items():
             if hasattr(base, key):
+                # These fields used to live in extras. A platform override
+                # must replace that legacy value as it did before promotion.
+                if key in ("attention_backend", "moe_backend", "linear_backend"):
+                    base.engine_extras.pop(key, None)
                 # Deep-merge dict-valued fields listed in _DEEP_MERGE_KEYS so
                 # platform overlays don't silently clobber sibling keys (e.g.
                 # setting default_sampling_params={max_tokens: 2048} must not

@@ -22,6 +22,7 @@ from vllm_omni.config.stage_config import (
     StageDeployConfig,
     StageExecutionType,
     StagePipelineConfig,
+    _apply_platform_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
 )
@@ -155,6 +156,19 @@ def test_extras_only_backend_is_preserved(execution_type):
     typed = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_configs[0]
     assert build_legacy_engine_args_dict(legacy, model="unused")["linear_backend"] == "torch"
     assert build_engine_args_dict_from_omni_stage_config(typed, model="unused")["linear_backend"] == "torch"
+
+
+def test_platform_backend_override_replaces_legacy_extra():
+    deploy = DeployConfig(
+        stages=[StageDeployConfig(stage_id=0, engine_extras={"attention_backend": "FLASHINFER"})],
+        platforms={"rocm": {"stages": [{"stage_id": 0, "attention_backend": "TRITON_ATTN"}]}},
+    )
+    deploy = _apply_platform_overrides(deploy, platform="rocm")
+    pipeline = _pipeline(StageExecutionType.LLM_AR)
+    legacy = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
+    typed = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_configs[0]
+    assert build_legacy_engine_args_dict(legacy, model="unused")["attention_backend"] == "TRITON_ATTN"
+    assert build_engine_args_dict_from_omni_stage_config(typed, model="unused")["attention_backend"] == "TRITON_ATTN"
 
 
 @pytest.mark.parametrize("config_field", ["model_config", "diffusion_config"])
