@@ -796,7 +796,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True, extra="forbid"))
-class _DiffusionConfigProjection(_TrackExplicitConfigFields):
+class _DiffusionConfigProjection:
     """Diffusion-specific per-stage settings.
 
     Shared AR/diffusion fields are projected into the other sub-configs.  This

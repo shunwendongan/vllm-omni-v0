@@ -1113,15 +1113,7 @@ def _project_omni_stage_engine_args(
         # explicit diffusion selection copied above. Retain explicit model
         # inputs for callers using the shared model config representation.
         model_explicit = getattr(stage_config.model_config, "_omni_explicit_fields", ())
-        diffusion_explicit = getattr(diffusion_stage.diffusion_config, "_omni_explicit_fields", ())
-        for name in ("moe_backend", "linear_backend"):
-            if name in model_explicit and name in diffusion_explicit:
-                if getattr(stage_config.model_config, name) != getattr(diffusion_stage.diffusion_config, name):
-                    raise ValueError(
-                        f"stage {stage_config.stage_id}: conflicting {name} in model_config and diffusion_config"
-                    )
-            if name not in model_explicit or name in diffusion_explicit:
-                model_excluded_fields.add(name)
+        model_excluded_fields.update(name for name in ("moe_backend", "linear_backend") if name not in model_explicit)
     if not is_diffusion:
         # These values configure OmniDiffusionConfig or its worker process;
         # OmniEngineArgs has no matching fields for LLM stages.

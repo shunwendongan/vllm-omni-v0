@@ -10,6 +10,7 @@ one CUDA GPU. No dispatch or numerical implementation is mocked.
 import pytest
 import torch
 from vllm.config import set_current_vllm_config
+from vllm.model_executor.layers import linear
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.utils import default_unquantized_gemm
 from vllm.platforms import current_platform
@@ -34,7 +35,7 @@ pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, pytest.mark.cuda]
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA dispatch smoke test")
-def test_tiny_flux_runs_requested_backends(tmp_path):
+def test_tiny_flux_runs_requested_backends(tmp_path, mocker):
     stage = VllmOmniDiffusionStageConfig(
         stage_pipeline_config=StagePipelineConfig(
             stage_id=0,
@@ -64,6 +65,9 @@ def test_tiny_flux_runs_requested_backends(tmp_path):
             distributed_init_method=f"file://{tmp_path / 'distributed'}",
         )
         initialize_model_parallel(sequence_parallel_size=1)
+        # Observe inputs to the real selector without replacing its behavior.
+        # On Ampere, "torch" and "auto" can resolve to the same callable.
+        dispatch = mocker.spy(linear, "dispatch_unquantized_gemm")
         with set_current_vllm_config(config), set_current_diffusion_config(od_config):
             model = (
                 FluxTransformer2DModel(
@@ -97,6 +101,8 @@ def test_tiny_flux_runs_requested_backends(tmp_path):
                 assert isinstance(layer.attention, SDPAImpl)
                 attentions.append(name)
         assert linears and attentions
+        assert dispatch.call_count == len(linears)
+        assert all(call.args == ("torch",) for call in dispatch.call_args_list)
 
         def random_tensor(*shape):
             return torch.randn(*shape, device="cuda", dtype=torch.bfloat16, generator=generator)

@@ -105,29 +105,14 @@ stages:
 ```
 
 The deploy fields default to `null` (no override). Effective MoE/linear
-defaults remain `auto`, except existing model defaults such as Qwen3-Omni's
-omitted MoE choice. Explicit `moe_backend: auto` still bypasses that model
-default. vLLM's `KernelConfig` validates MoE/linear names and normalizes case
-and hyphens (`FLASHINFER-CUTLASS` becomes `flashinfer_cutlass`). Unlike attention,
-MoE/linear `auto` stays the string `auto`; it is not converted to `None`.
-AR attention keeps upstream enum parsing and `auto`/`None` semantics.
+defaults remain `auto`, and explicit `auto` remains distinct from omission.
+`KernelConfig` supplies validation and case/hyphen normalization. AR attention
+continues to use upstream enum parsing and `auto`/`None` semantics.
 
-CLI/runtime overrides retain precedence over deploy values. A non-null
-first-class backend field wins over the same key in `engine_extras`, with a
-warning on conflicting values. Extras-only configurations remain supported.
-For directly constructed structured diffusion stages, put kernel selections
-in `diffusion_config`; an explicit shared `model_config` selection is also
-preserved when the diffusion field is omitted. Conflicting explicit values
-in both objects raise an error instead of silently overriding one another.
-
-Selection is a request to the existing backend mechanism, not a guarantee
-that every layer uses that implementation. Upstream linear filter/fallback
-semantics are unchanged, and ordinary `torch.nn.Linear` layers do not consume
-vLLM's kernel config. In vLLM 0.29, unquantized ROCm dispatch chooses its ROCm
-implementation without consulting `linear_backend`; non-CUDA/non-CPU dispatch
-also falls back to the default implementation. NPU plugins may override this
-behavior. NPU/ROCm hardware validation is not implied by config propagation.
-On CUDA, unsupported FlashInfer BF16 choices retain upstream fallback warnings.
+CLI/runtime values retain their existing precedence. A first-class backend
+field wins over the same `engine_extras` key, with a warning on conflict;
+extras-only configurations remain supported. Existing backend fallback rules
+are unchanged, and this PR does not claim support for unvalidated platforms.
 
 An offline CUDA component smoke test runs a tiny, randomly initialized native
 FLUX transformer, checks the actual linear callable and SDPA implementation,
@@ -144,7 +129,7 @@ pytest -s -v tests/config/test_backend_selection.py -m 'core_model and cpu'
 ```
 
 Both commands require matching vLLM/vLLM-Omni dependencies. The component smoke
-test additionally needs one CUDA GPU; it is opt-in, not an added CI GPU job.
+test additionally needs one CUDA GPU; it is opt-in and not a performance claim.
 
 #### Field reference
 
