@@ -89,6 +89,9 @@ Diffusion stages share `moe_backend` and `linear_backend`, but use their own
 `diffusion_attention_config` (or the deprecated `diffusion_attention_backend`
 shorthand), not AR's `attention_backend`.
 
+These backend fields are stage-only: set them under each `stages` entry, not
+at the deploy YAML top level, where they are ignored.
+
 For a pipeline with AR stage 0 and diffusion stage 1, the deploy fragment is:
 
 ```yaml
@@ -113,6 +116,8 @@ CLI/runtime values retain their existing precedence. A first-class backend
 field wins over the same `engine_extras` key, with a warning on conflict;
 extras-only configurations remain supported. Existing backend fallback rules
 are unchanged, and this PR does not claim support for unvalidated platforms.
+For typed diffusion stages, an explicitly supplied model-config backend wins
+over a different explicitly supplied diffusion-config backend, with a warning.
 In vLLM 0.29, unquantized ROCm GEMM dispatch does not consult `linear_backend`;
 NPU plugin behavior is not validated here. Plain `torch.nn.Linear` layers do
 not consume vLLM's kernel configuration.

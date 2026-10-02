@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Focused tests for Item 1 backend fields and their final projections."""
 
+import warnings
 from dataclasses import fields
 
 import pytest
@@ -14,6 +15,7 @@ from vllm_omni.config.omni_config import (
     OmniStageModelConfig,
     VllmOmniConfig,
     VllmOmniDiffusionStageConfig,
+    _DiffusionConfigProjection,
     extract_diffusion_stage_config_kwargs,
 )
 from vllm_omni.config.stage_config import (
@@ -169,6 +171,60 @@ def test_platform_backend_override_replaces_legacy_extra():
     typed = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_configs[0]
     assert build_legacy_engine_args_dict(legacy, model="unused")["attention_backend"] == "TRITON_ATTN"
     assert build_engine_args_dict_from_omni_stage_config(typed, model="unused")["attention_backend"] == "TRITON_ATTN"
+
+
+@pytest.mark.parametrize(
+    ("field", "first_class", "legacy"),
+    [
+        ("attention_backend", "TRITON_ATTN", "FLASHINFER"),
+        ("moe_backend", "triton", "torch"),
+        ("linear_backend", "torch", "cutlass"),
+    ],
+)
+def test_nested_platform_engine_extras_cannot_override_first_class_backend(field, first_class, legacy):
+    deploy = DeployConfig(
+        stages=[StageDeployConfig(stage_id=0, **{field: first_class})],
+        platforms={"rocm": {"stages": [{"stage_id": 0, "engine_extras": {field: legacy}}]}},
+    )
+    with pytest.warns(UserWarning, match=f"{field}.*engine_extras"):
+        deploy = _apply_platform_overrides(deploy, platform="rocm")
+
+    pipeline = _pipeline(StageExecutionType.LLM_AR)
+    legacy = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
+    typed = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_configs[0]
+    assert deploy.stages[0].engine_extras.get(field) is None
+    expected = first_class if field == "attention_backend" else first_class.lower()
+    assert build_legacy_engine_args_dict(legacy, model="unused")[field] == expected
+    assert build_engine_args_dict_from_omni_stage_config(typed, model="unused")[field] == expected
+
+
+@pytest.mark.parametrize("field", ["linear_backend", "moe_backend"])
+def test_diffusion_model_config_conflict_warns_and_model_wins(field):
+    stage = VllmOmniDiffusionStageConfig(
+        stage_pipeline_config=_pipeline(StageExecutionType.DIFFUSION).stages[0],
+        model_config=OmniStageModelConfig(**{field: "torch" if field == "linear_backend" else "triton"}),
+        diffusion_config=_DiffusionConfigProjection.from_kwargs(
+            **{field: "cutlass" if field == "linear_backend" else "auto"}
+        ),
+    )
+    with pytest.warns(UserWarning, match=f"model_config.*{field}.*diffusion_config"):
+        args = build_engine_args_dict_from_omni_stage_config(stage, model="unused")
+    assert args[field] == ("torch" if field == "linear_backend" else "triton")
+
+
+@pytest.mark.parametrize("field", ["linear_backend", "moe_backend"])
+def test_diffusion_equal_normalized_explicit_backends_do_not_warn(field):
+    value = "torch" if field == "linear_backend" else "triton"
+    stage = VllmOmniDiffusionStageConfig(
+        stage_pipeline_config=_pipeline(StageExecutionType.DIFFUSION).stages[0],
+        model_config=OmniStageModelConfig(**{field: value.upper()}),
+        diffusion_config=_DiffusionConfigProjection.from_kwargs(**{field: value}),
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        args = build_engine_args_dict_from_omni_stage_config(stage, model="unused")
+    assert not [warning for warning in caught if "model_config" in str(warning.message)]
+    assert args[field] == value
 
 
 @pytest.mark.parametrize("config_field", ["model_config", "diffusion_config"])

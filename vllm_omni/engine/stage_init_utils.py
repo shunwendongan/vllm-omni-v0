@@ -19,6 +19,7 @@ import multiprocessing as mp
 import os
 import tempfile
 import time
+import warnings
 from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
@@ -1113,7 +1114,20 @@ def _project_omni_stage_engine_args(
         # explicit diffusion selection copied above. Retain explicit model
         # inputs for callers using the shared model config representation.
         model_explicit = getattr(stage_config.model_config, "_omni_explicit_fields", ())
-        model_excluded_fields.update(name for name in ("moe_backend", "linear_backend") if name not in model_explicit)
+        diffusion_explicit = getattr(diffusion_stage.diffusion_config, "_omni_explicit_fields", ())
+        for name in ("moe_backend", "linear_backend"):
+            if name not in model_explicit:
+                model_excluded_fields.add(name)
+            elif name in diffusion_explicit:
+                model_value = getattr(stage_config.model_config, name)
+                diffusion_value = getattr(diffusion_stage.diffusion_config, name)
+                if model_value != diffusion_value:
+                    warnings.warn(
+                        f"stage {stage_config.stage_id}: model_config.{name}={model_value!r} overrides "
+                        f"diffusion_config.{name}={diffusion_value!r}.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
     if not is_diffusion:
         # These values configure OmniDiffusionConfig or its worker process;
         # OmniEngineArgs has no matching fields for LLM stages.

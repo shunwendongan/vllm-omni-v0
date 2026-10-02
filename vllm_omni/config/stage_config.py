@@ -30,6 +30,30 @@ _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
 
+def _normalize_stage_backend_fields(stage: StageDeployConfig) -> None:
+    """Normalize promoted backends and enforce their precedence over extras."""
+    kernels = {
+        name: getattr(stage, name) for name in ("moe_backend", "linear_backend") if getattr(stage, name) is not None
+    }
+    normalized = KernelConfig(**kernels)
+    for name in kernels:
+        setattr(stage, name, getattr(normalized, name))
+
+    # Only backend selections gain this precedence rule; unrelated extras keep
+    # their existing merge behavior. Never retain a duplicate legacy key.
+    stage.engine_extras = dict(stage.engine_extras)
+    for name in ("attention_backend", "moe_backend", "linear_backend"):
+        value = getattr(stage, name)
+        if value is not None and name in stage.engine_extras:
+            extra = stage.engine_extras.pop(name)
+            if value != extra:
+                warnings.warn(
+                    f"stage {stage.stage_id}: {name}={value!r} overrides engine_extras[{name!r}]={extra!r}.",
+                    UserWarning,
+                    stacklevel=3,
+                )
+
+
 def pipeline_cfg_resolver(config_type: type[PretrainedConfig]):
     """Wraps a resolver such that we return None if a hf_config of the wrong type is provided."""
 
@@ -522,25 +546,7 @@ class StageDeployConfig:
     engine_extras: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        kernels = {
-            name: getattr(self, name) for name in ("moe_backend", "linear_backend") if getattr(self, name) is not None
-        }
-        normalized = KernelConfig(**kernels)
-        for name in kernels:
-            setattr(self, name, getattr(normalized, name))
-        # Only backend selections gain this precedence rule; unrelated extras
-        # keep their existing merge behavior. Never mutate caller-owned input.
-        self.engine_extras = dict(self.engine_extras)
-        for name in ("attention_backend", "moe_backend", "linear_backend"):
-            value = getattr(self, name)
-            if value is not None and name in self.engine_extras:
-                extra = self.engine_extras.pop(name)
-                if value != extra:
-                    warnings.warn(
-                        f"stage {self.stage_id}: {name}={value!r} overrides engine_extras[{name!r}]={extra!r}.",
-                        UserWarning,
-                        stacklevel=2,
-                    )
+        _normalize_stage_backend_fields(self)
 
 
 @dataclass(frozen=True)
@@ -931,12 +937,13 @@ def _apply_platform_overrides(
                     type(po.env).__name__,
                 )
                 base.env = po.env
+        # Remove base legacy values before merging the entire overlay. Nested
+        # extras in the overlay must still be checked regardless of key order.
+        for key in ("attention_backend", "moe_backend", "linear_backend"):
+            if key in po.overrides:
+                base.engine_extras.pop(key, None)
         for key, val in po.overrides.items():
             if hasattr(base, key):
-                # These fields used to live in extras. A platform override
-                # must replace that legacy value as it did before promotion.
-                if key in ("attention_backend", "moe_backend", "linear_backend"):
-                    base.engine_extras.pop(key, None)
                 # Deep-merge dict-valued fields listed in _DEEP_MERGE_KEYS so
                 # platform overlays don't silently clobber sibling keys (e.g.
                 # setting default_sampling_params={max_tokens: 2048} must not
@@ -949,6 +956,9 @@ def _apply_platform_overrides(
                 setattr(base, key, val)
             else:
                 base.engine_extras[key] = val
+        # Platform overlays run after construction and can reintroduce nested
+        # backend extras. Reapply normalization and first-class precedence.
+        _normalize_stage_backend_fields(base)
 
     return deploy
 
