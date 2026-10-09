@@ -124,20 +124,34 @@ def test_duplicate_edge_equal_global_and_inline_specs_are_accepted():
     assert config.connectors[("0", "1")].extra == {"buffer_size": 4096}
 
 
-def test_duplicate_edge_with_different_extra_fails_fast():
+@pytest.mark.parametrize("schema", ["new", "legacy"])
+@pytest.mark.parametrize("reverse_order", [False, True], ids=["output-first", "input-first"])
+def test_duplicate_edge_with_different_extra_fails_fast(schema, reverse_order):
     config_dict = _duplicate_edge_config(
-        output_extra={"connector_get_max_wait": 300},
-        input_extra={"connector_get_max_wait": 600},
+        output_extra={"connector_get_max_wait": 300, "role": "sender"},
+        input_extra={"connector_get_max_wait": 600, "role": "receiver"},
+        schema=schema,
     )
+    if reverse_order:
+        config_dict["stages" if schema == "new" else "stage_args"].reverse()
 
-    with pytest.raises(ValueError, match=r"Conflicting connector options for edge 0->1.*connector_get_max_wait"):
+    with pytest.raises(ValueError, match=r"Conflicting connector options for edge 0->1.*connector_get_max_wait") as exc:
         load_omni_transfer_config(config_dict=config_dict)
 
+    message = str(exc.value)
+    assert "output_connectors of stage 0 (to_stage_1)" in message
+    assert "input_connectors of stage 1 (from_stage_0)" in message
+    assert "role" not in message
+    assert "300" not in message
+    assert "600" not in message
 
-def test_duplicate_edge_with_different_connector_name_fails_fast():
+
+@pytest.mark.parametrize("schema", ["new", "legacy"])
+def test_duplicate_edge_with_different_connector_name_fails_fast(schema):
     config_dict = _duplicate_edge_config(
         output_name="FirstConnector",
         input_name="SecondConnector",
+        schema=schema,
     )
 
     with pytest.raises(ValueError, match=r"Connector type mismatch for edge 0->1"):
@@ -154,16 +168,44 @@ def test_duplicate_edge_with_nested_extra_difference_fails_fast():
         load_omni_transfer_config(config_dict=config_dict)
 
 
-def test_duplicate_edge_role_differences_do_not_conflict():
+@pytest.mark.parametrize("schema", ["new", "legacy"])
+@pytest.mark.parametrize(
+    ("output_role", "input_role", "reverse_order", "expected_role"),
+    [
+        pytest.param("sender", "receiver", False, "sender", id="both-output-first"),
+        pytest.param("sender", "receiver", True, "receiver", id="both-input-first"),
+        pytest.param("sender", None, False, "sender", id="output-role-output-first"),
+        pytest.param("sender", None, True, None, id="output-role-input-first"),
+        pytest.param(None, "receiver", False, None, id="input-role-output-first"),
+        pytest.param(None, "receiver", True, "receiver", id="input-role-input-first"),
+        pytest.param(None, None, False, None, id="no-role-output-first"),
+        pytest.param(None, None, True, None, id="no-role-input-first"),
+    ],
+)
+def test_duplicate_edge_preserves_first_role(schema, output_role, input_role, reverse_order, expected_role):
     config_dict = _duplicate_edge_config(
-        output_extra={"role": "sender"},
-        input_extra={"role": "receiver"},
+        output_extra={} if output_role is None else {"role": output_role},
+        input_extra={} if input_role is None else {"role": input_role},
+        schema=schema,
     )
+    if reverse_order:
+        config_dict["stages" if schema == "new" else "stage_args"].reverse()
 
     config = load_omni_transfer_config(config_dict=config_dict)
 
     assert config is not None
-    assert config.connectors[("0", "1")].extra == {"role": "sender"}
+    expected_extra = {} if expected_role is None else {"role": expected_role}
+    assert list(config.connectors) == [("0", "1")]
+    assert config.connectors[("0", "1")].extra == expected_extra
+
+    for stage_id, direction, connector_key in [(0, "sender", "to_stage_1"), (1, "receiver", "from_stage_0")]:
+        resolved, _, _ = resolve_omni_kv_config_for_stage(config, stage_id)
+        assert resolved is not None
+        assert resolved["role"] == (expected_role or direction)
+        stage_config = get_connectors_config_for_stage(config, stage_id)
+        assert stage_config[connector_key]["spec"]["extra"]["role"] == (expected_role or direction)
+
+    assert config.connectors[("0", "1")].extra == expected_extra
 
 
 @pytest.mark.parametrize(
@@ -222,11 +264,16 @@ def test_duplicate_edge_does_not_mutate_config_dict():
     assert config_dict == original
 
 
-def test_duplicate_edge_missing_and_none_extra_values_conflict():
+@pytest.mark.parametrize("schema", ["new", "legacy"])
+@pytest.mark.parametrize("reverse_order", [False, True], ids=["output-first", "input-first"])
+def test_duplicate_edge_missing_and_none_extra_values_conflict(schema, reverse_order):
     config_dict = _duplicate_edge_config(
         output_extra={},
         input_extra={"wakeup_scope": None},
+        schema=schema,
     )
+    if reverse_order:
+        config_dict["stages" if schema == "new" else "stage_args"].reverse()
 
     with pytest.raises(ValueError, match=r"Conflicting connector options for edge 0->1.*wakeup_scope"):
         load_omni_transfer_config(config_dict=config_dict)

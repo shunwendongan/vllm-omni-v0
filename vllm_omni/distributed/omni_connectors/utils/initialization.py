@@ -241,11 +241,8 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
     stage_connectors_config = {}
     target_stage = str(stage_id)
 
-    # Iterate through all configured edges and inject direction-specific role.
-    # The shared edge-level ConnectorSpec is role-neutral; each stage gets
-    # the correct role ("sender" or "receiver") based on its position in
-    # the edge so that MooncakeTransferEngineConnector (and any future
-    # role-aware connector) initializes correctly.
+    # Fill a missing role from the stage's direction, preserving explicit roles
+    # in the shared edge-level ConnectorSpec for compatibility.
     for (from_stage, to_stage), spec in transfer_config.connectors.items():
         if to_stage == target_stage:
             # Incoming edge → this stage is the receiver
@@ -289,6 +286,9 @@ def _register_connector_spec(
             f"but {source} specifies '{connector.name}'"
         )
 
+    # Keep the first spec, including its explicit role or the absence of one.
+    # Direction-specific role differences do not conflict with equivalent
+    # edge-level backend options.
     existing_extra = {key: value for key, value in existing.extra.items() if key != "role"}
     connector_extra = {key: value for key, value in connector.extra.items() if key != "role"}
     conflicting_fields = sorted(
@@ -366,9 +366,9 @@ def load_omni_transfer_config(
         stage_id = str(stage_config["stage_id"])
 
         # Input connectors (this stage is the receiver)
-        # NOTE: role is NOT injected here — the shared edge-level ConnectorSpec
-        # must remain role-neutral.  Role is injected per-stage in
-        # get_connectors_config_for_stage() / resolve_omni_kv_config_for_stage().
+        # Preserve configured roles without injecting defaults during parsing.
+        # get_connectors_config_for_stage() / resolve_omni_kv_config_for_stage()
+        # fill missing roles from each stage's direction.
         for input_key, conn_ref in stage_config.get("input_connectors", {}).items():
             if isinstance(conn_ref, str):
                 # Reference to global connector
