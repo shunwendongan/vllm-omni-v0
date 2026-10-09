@@ -171,16 +171,17 @@ def test_duplicate_edge_role_differences_do_not_conflict():
     [("output_connectors", 0, "receiver"), ("input_connectors", 1, "sender")],
 )
 def test_explicit_role_is_preserved_for_single_sided_edge(stage_key, stage_id, expected_role):
-    config_dict = {"runtime": {"connectors": {}}, "stage_args": []}
+    stage_args: list[dict[str, object]] = []
+    config_dict = {"runtime": {"connectors": {}}, "stage_args": stage_args}
     if stage_key == "output_connectors":
-        config_dict["stage_args"].append(
+        stage_args.append(
             {
                 "stage_id": 0,
                 "output_connectors": {"to_stage_1": {"name": "TestConnector", "extra": {"role": expected_role}}},
             }
         )
     else:
-        config_dict["stage_args"].append(
+        stage_args.append(
             {
                 "stage_id": 1,
                 "input_connectors": {"from_stage_0": {"name": "TestConnector", "extra": {"role": expected_role}}},
