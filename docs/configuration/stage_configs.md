@@ -161,6 +161,34 @@ RAY_ADDRESS=10.0.0.1:6379 vllm serve MODEL --omni --deploy-config my_deploy.yaml
 Omni creates actors on the resources of that cluster; it does not start Ray
 on additional machines.
 
+### Stage CPU placement
+
+On Linux, stages can use vLLM's NUMA settings to select CPU lists. Add the
+settings to the existing stage entries in your deploy configuration:
+
+```yaml
+stages:
+  - stage_id: 0
+    numa_bind: true
+    numa_bind_nodes: [0]
+    numa_bind_cpus: ["2-3"]
+  - stage_id: 1
+    numa_bind: true
+    numa_bind_nodes: [0]
+    numa_bind_cpus: ["4-7"]
+```
+
+These CPU and NUMA indices are examples; choose indices available to the
+process or container. Use one CPU-list entry per visible GPU.
+Binding requires `numactl` and
+`VLLM_WORKER_MULTIPROC_METHOD=spawn`.
+
+With an in-process executor (`uni`), the worker's CPU list applies to the
+stage EngineCore itself. With a multiprocess executor (`mp`), workers use
+their CPU lists and EngineCore retains its wider NUMA-node binding. Choose
+CPU sets away from competing workloads; affinity does not reserve CPUs
+exclusively.
+
 ### Stage-level runner selection
 
 `model_runner: v1` or `v2` at the deploy level sets the default runner.
@@ -657,8 +685,9 @@ the intended GPU, and warm the complete pipeline before measuring performance.
 
 ## MOSS-TTS Local 1.5 with Model Runner V2
 
-`OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5` can opt into CUDA MRV2 using
-the shared runtime introduced for Qwen3-TTS:
+`OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5` defaults to CUDA MRV2 using
+the shared runtime introduced for Qwen3-TTS. To select the C64 profile without
+MPS explicitly:
 
 ```bash
 vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
@@ -666,7 +695,7 @@ vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
 ```
 
 This profile inherits the batching, codec graph buckets and 1-frame/15-frame
-chunk geometry from `moss_tts_local.yaml`, and selects V2 for both the Local
+chunk geometry from `moss_tts_local_v1.yaml`, and selects V2 for both the Local
 Talker and codec stages. The Local depth predictor exposes the MRV2 `mtp`
 capabilities while retaining its V1 `talker_mtp` implementation, sampling
 defaults and explicit request-seed handling. Codec chunks use the native data
@@ -690,8 +719,12 @@ guarantee that 128 maximum-length prompts fit simultaneously. See the
 [MOSS recipe](gh-file:recipes/OpenMOSS/MOSS-TTS.md#local-15-mrv2-and-slot-attention)
 for activation, backend comparisons, memory requirements and benchmark commands.
 
-Omitting `--deploy-config`, or selecting `moss_tts_local.yaml`, retains V1.
-NPU, XPU, ROCm and MUSA overrides also retain V1. This profile does not enable
+Omitting `--deploy-config` selects the C128 system profile on CUDA GPUs with
+at least 140 GiB memory and MPS available. Smaller GPUs or a failed memory
+query use C64 with utilization-based memory budgets; missing MPS selects
+C64 without MPS. Selecting `moss_tts_local.yaml` explicitly uses C64 with MPS.
+Use `moss_tts_local_v1.yaml` for the previous V1 deployment.
+NPU, XPU, ROCm and MUSA overrides retain V1. These profiles do not enable
 MRV2 for MOSS Delay, Realtime or Nano. Local 1.5 outputs 48 kHz stereo audio;
 set `VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=48000` and
 `VLLM_OMNI_BENCH_AUDIO_CHANNELS=2` when benchmarking raw PCM.
@@ -699,5 +732,5 @@ set `VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=48000` and
 Event-driven orchestration remains independently selectable with
 `VLLM_OMNI_EVENT_DRIVEN_ORCH=0` or `1`. Keep the runner and deployment identical
 when comparing these modes. Model-runner selection does not change the
-orchestration default or enable experimental reference encoding, chunk ramps,
-generation-output draining or MPS.
+orchestration default. MPS, codec dispatch and graph settings belong to the
+deployment profile; the automatic CUDA default selects MPS when available.
