@@ -47,7 +47,17 @@ def _normalize_stage_backend_fields(stage: StageDeployConfig) -> None:
         value = getattr(stage, name)
         if value is not None and name in stage.engine_extras:
             extra = stage.engine_extras.pop(name)
-            if value != extra:
+            comparable_extra = extra
+            if name in ("moe_backend", "linear_backend"):
+                # First-class fields have already gone through KernelConfig,
+                # while legacy extras may still use mixed case or hyphens.
+                # Compare the same canonical spelling before warning.
+                try:
+                    comparable_extra = getattr(KernelConfig(**{name: extra}), name)
+                except (TypeError, ValueError):
+                    # An invalid shadowed extra is still discarded, as before.
+                    comparable_extra = extra
+            if value != comparable_extra:
                 warnings.warn(
                     f"stage {stage.stage_id}: {name}={value!r} overrides engine_extras[{name!r}]={extra!r}.",
                     UserWarning,

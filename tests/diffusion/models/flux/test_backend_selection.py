@@ -15,6 +15,7 @@ from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.utils import default_unquantized_gemm
 from vllm.platforms import current_platform
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.config.omni_config import VllmOmniDiffusionStageConfig, extract_diffusion_stage_config_kwargs
 from vllm_omni.config.stage_config import StageExecutionType, StagePipelineConfig
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
@@ -31,9 +32,10 @@ from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DMo
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
 
-pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, pytest.mark.cuda]
+pytestmark = [pytest.mark.local_model, pytest.mark.diffusion]
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA dispatch smoke test")
 def test_tiny_flux_runs_requested_backends(tmp_path, mocker):
     stage = VllmOmniDiffusionStageConfig(

@@ -25,6 +25,7 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
     _apply_platform_overrides,
+    build_stage_runtime_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
 )
@@ -97,6 +98,7 @@ def test_deploy_backends_reach_final_engine_config(tmp_path, tiny_ar_model, exec
         final = create_diffusion_vllm_config(torch.device("cpu"), diffusion_config)
         assert final.kernel_config.linear_backend == "torch"
         assert final.kernel_config.moe_backend == "triton"
+        assert diffusion_config.diffusion_attention_config.default.backend == "torch_sdpa"
     else:
         names = {field.name for field in fields(OmniEngineArgs)}
         kwargs = {name: value for name, value in args.items() if name in names}
@@ -105,6 +107,150 @@ def test_deploy_backends_reach_final_engine_config(tmp_path, tiny_ar_model, exec
         assert final.kernel_config.linear_backend == "torch"
         assert final.kernel_config.moe_backend == "triton"
         assert final.attention_config.backend is AttentionBackendEnum.TRITON_ATTN
+
+
+@pytest.mark.parametrize("execution_type", [StageExecutionType.LLM_AR, StageExecutionType.DIFFUSION])
+@pytest.mark.parametrize("typed", [False, True])
+@pytest.mark.parametrize("stage_scoped", [False, True])
+def test_backend_cli_overrides_deploy_yaml(tmp_path, execution_type, typed, stage_scoped):
+    attention_field = (
+        "diffusion_attention_backend" if execution_type == StageExecutionType.DIFFUSION else "attention_backend"
+    )
+    yaml_attention = "flash_attn" if execution_type == StageExecutionType.DIFFUSION else "FLASHINFER"
+    cli_attention = "torch_sdpa" if execution_type == StageExecutionType.DIFFUSION else "TRITON_ATTN"
+    path = tmp_path / "deploy.yaml"
+    path.write_text(
+        f"stages:\n  - stage_id: 0\n    linear_backend: cutlass\n    moe_backend: auto\n"
+        f"    {attention_field}: {yaml_attention}\n"
+    )
+    deploy = load_deploy_config(str(path))
+    pipeline = _pipeline(execution_type)
+    prefix = "stage_0_" if stage_scoped else ""
+    cli = {
+        f"{prefix}linear_backend": "torch",
+        f"{prefix}moe_backend": "triton",
+        f"{prefix}{attention_field}": cli_attention,
+    }
+
+    if typed:
+        stage = VllmOmniConfig.from_pipeline_config(
+            pipeline, user_deploy_config=deploy, cli_overrides=cli
+        ).stage_configs[0]
+        args = build_engine_args_dict_from_omni_stage_config(stage, model="unused")
+    else:
+        stage = merge_pipeline_deploy(pipeline, deploy)[0]
+        stage.runtime_overrides = build_stage_runtime_overrides(stage.stage_id, cli)
+        args = build_legacy_engine_args_dict(stage.to_omegaconf(), model="unused")
+
+    assert args["linear_backend"] == "torch"
+    assert args["moe_backend"] == "triton"
+    if execution_type == StageExecutionType.DIFFUSION:
+        kwargs = extract_diffusion_stage_config_kwargs(args, stage_id=0, include_engine_adapter_metadata=True)
+        kwargs.pop("model")
+        config = OmniDiffusionConfig.from_kwargs(**kwargs)
+        assert config.diffusion_attention_config.default.backend == cli_attention
+        assert config.linear_backend == "torch"
+        assert config.moe_backend == "triton"
+    else:
+        assert args[attention_field] == cli_attention
+
+
+@pytest.mark.parametrize("execution_type", [StageExecutionType.LLM_AR, StageExecutionType.DIFFUSION])
+@pytest.mark.parametrize("typed", [False, True])
+def test_deploy_backends_are_independent_per_stage(tmp_path, execution_type, typed):
+    attention_field = (
+        "diffusion_attention_backend" if execution_type == StageExecutionType.DIFFUSION else "attention_backend"
+    )
+    attentions = (
+        ("torch_sdpa", "flash_attn")
+        if execution_type == StageExecutionType.DIFFUSION
+        else ("TRITON_ATTN", "FLASHINFER")
+    )
+    path = tmp_path / "deploy.yaml"
+    path.write_text(
+        "stages:\n"
+        f"  - stage_id: 0\n    linear_backend: torch\n    moe_backend: triton\n"
+        f"    {attention_field}: {attentions[0]}\n"
+        f"  - stage_id: 1\n    linear_backend: cutlass\n    moe_backend: auto\n"
+        f"    {attention_field}: {attentions[1]}\n"
+    )
+    deploy = load_deploy_config(str(path))
+    pipeline = PipelineConfig(
+        model_type="backend-test",
+        stages=tuple(
+            StagePipelineConfig(
+                stage_id=stage_id,
+                model_stage=f"model_{stage_id}",
+                execution_type=execution_type,
+                final_output=stage_id == 1,
+            )
+            for stage_id in range(2)
+        ),
+    )
+    if typed:
+        stages = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_configs
+        args = [build_engine_args_dict_from_omni_stage_config(stage, model="unused") for stage in stages]
+    else:
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        args = [build_legacy_engine_args_dict(stage.to_omegaconf(), model="unused") for stage in stages]
+
+    for stage_id, (linear, moe) in enumerate((("torch", "triton"), ("cutlass", "auto"))):
+        assert args[stage_id]["linear_backend"] == linear
+        assert args[stage_id]["moe_backend"] == moe
+        if execution_type == StageExecutionType.DIFFUSION:
+            kwargs = extract_diffusion_stage_config_kwargs(
+                args[stage_id], stage_id=stage_id, include_engine_adapter_metadata=True
+            )
+            kwargs.pop("model")
+            config = OmniDiffusionConfig.from_kwargs(**kwargs)
+            assert config.diffusion_attention_config.default.backend == attentions[stage_id]
+        else:
+            assert args[stage_id][attention_field] == attentions[stage_id]
+
+
+@pytest.mark.parametrize(
+    ("backend_field", "first_class", "extra", "expected"),
+    [
+        ("linear_backend", "TORCH", "TORCH", "torch"),
+        ("linear_backend", "torch", "TORCH", "torch"),
+        ("moe_backend", "TRITON", "triton", "triton"),
+        ("moe_backend", "FLASHINFER-CUTLASS", "flashinfer_cutlass", "flashinfer_cutlass"),
+        ("linear_backend", "FLASHINFER-CUTLASS", "FLASHINFER-CUTLASS", "flashinfer_cutlass"),
+    ],
+)
+@pytest.mark.parametrize("platform_overlay", [False, True])
+def test_equivalent_stage_and_extra_backends_do_not_warn(backend_field, first_class, extra, expected, platform_overlay):
+    extras = {backend_field: extra, "unrelated": "keep"}
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        stage = StageDeployConfig(
+            stage_id=0,
+            **{backend_field: first_class},
+            engine_extras={} if platform_overlay else extras,
+        )
+        if platform_overlay:
+            deploy = DeployConfig(
+                stages=[stage],
+                platforms={"rocm": {"stages": [{"stage_id": 0, "engine_extras": extras}]}},
+            )
+            stage = _apply_platform_overrides(deploy, platform="rocm").stages[0]
+    assert not [warning for warning in caught if "engine_extras" in str(warning.message)]
+    assert getattr(stage, backend_field) == expected
+    assert backend_field not in stage.engine_extras
+    assert stage.engine_extras["unrelated"] == "keep"
+    assert extras == {backend_field: extra, "unrelated": "keep"}
+
+
+@pytest.mark.parametrize(("backend_field", "backend"), [("linear_backend", "torch"), ("moe_backend", "triton")])
+def test_first_class_backend_still_overrides_invalid_extra(backend_field, backend):
+    with pytest.warns(UserWarning, match=f"{backend_field}.*engine_extras"):
+        stage = StageDeployConfig(
+            stage_id=0,
+            **{backend_field: backend},
+            engine_extras={backend_field: "not-a-backend"},
+        )
+    assert getattr(stage, backend_field) == backend
+    assert backend_field not in stage.engine_extras
 
 
 @pytest.mark.parametrize("config_cls", [OmniStageModelConfig, OmniDiffusionConfig])
