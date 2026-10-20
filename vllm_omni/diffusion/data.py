@@ -114,17 +114,6 @@ def normalize_omni_diffusion_kwargs(
             fastvideo_vsa_topk=fastvideo_vsa_topk,
         )
 
-    auxiliary_text_encoder = config_kwargs.pop("auxiliary_text_encoder", None)
-    if auxiliary_text_encoder is not None:
-        extras = dict(config_kwargs.get("extras") or {})
-        if extras.get("auxiliary_text_encoder") is not None:
-            raise ValueError(
-                "Diffusion engine field 'auxiliary_text_encoder' cannot be provided both at the top level and in "
-                "'extras'."
-            )
-        extras["auxiliary_text_encoder"] = auxiliary_text_encoder
-        config_kwargs["extras"] = extras
-
     # Check environment variable as fallback for cache_backend.
     # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND.
     if "cache_backend" not in config_kwargs and apply_defaults:
@@ -1457,6 +1446,7 @@ class OmniDiffusionConfig:
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
+        validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
@@ -1805,11 +1795,6 @@ class OmniDiffusionConfig:
                         self.model_class_name = "Pi0Pipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
-                elif cfg.get("type") == "pi05":
-                    if self.model_class_name is None:
-                        self.model_class_name = "Pi05Pipeline"
-                    self.set_tf_model_config(TransformerConfig())
-                    self.update_multimodal_support()
                 elif model_type == "ti2v" and self.model_class_name == "ABotWorldCausalPipeline":
                     # The official ABot checkpoint uses its native single-directory
                     # layout and intentionally has no Diffusers pipeline index.
@@ -1891,6 +1876,7 @@ class DiffusionOutput:
     started_event_ids: list[str] = field(default_factory=list)
     active_event_ids: list[str] = field(default_factory=list)
     completed_event_ids: list[str] = field(default_factory=list)
+    coalesced_event_ids: list[str] = field(default_factory=list)
 
     # logged duration of stages
     stage_durations: dict[str, float] = field(default_factory=dict)
@@ -2454,6 +2440,31 @@ def build_attention_config(
         {k: v.backend for k, v in normalized.per_role.items()},
     )
     return normalized
+
+
+def validate_kv_cache_dtype_vs_attention_specs(
+    kv_cache_dtype: str | None,
+    attention_config: "AttentionConfig | None",
+) -> None:
+    """Reject a global attention-quant knob combined with per-backend quant specs.
+
+    ``diffusion_kv_cache_dtype`` requests quantized attention for every layer;
+    an explicit ``quant`` spec is the advanced per-backend override. Setting both
+    is contradictory intent — fail fast instead of picking one silently. A pure
+    ``flashinfer_backend`` variant pin without dtypes is not a conflict.
+    """
+    if kv_cache_dtype in (None, "auto", "float") or attention_config is None:
+        return
+    specs = [attention_config.default, *attention_config.per_role.values()]
+    for spec in specs:
+        if spec is None or spec.quant is None:
+            continue
+        if spec.quant.dtype_qk is not None or spec.quant.dtype_vo is not None:
+            raise ValueError(
+                "diffusion_kv_cache_dtype conflicts with a diffusion_attention_config quant spec: "
+                "the unified knob already requests quantized attention. Remove the explicit "
+                "quant spec, or set diffusion_kv_cache_dtype to 'auto' and keep the spec."
+            )
 
 
 @dataclass
